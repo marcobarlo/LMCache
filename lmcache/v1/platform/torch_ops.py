@@ -9,7 +9,7 @@ package -- consumers go through :class:`DeviceOps`, never this module directly.
 # Standard
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, cast
 import ctypes
 import ctypes.util
 import os
@@ -1283,8 +1283,14 @@ def multi_layer_block_kv_transfer(
     elif engine_kv_format == EngineKVFormat.NL_X_TWO_X_NB_BS_HS:
         # Must precede the generic MLA branch: is_mla() is also true for the
         # plane-tuple format, whose per-layer entries are tuples, not tensors.
+        # The tuple-branch validation above established that ``normalized``
+        # is the per-layer plane-tuple list; cast carries that to mypy, which
+        # cannot prove it from the normalizer's union return type.
         _transfer_per_layer_mla_tuple(
-            normalized,
+            cast(
+                "list[tuple[torch.Tensor, ...] | list[torch.Tensor]]",
+                normalized,
+            ),
             object_tensors,
             block_ids,
             n_block_ids,
