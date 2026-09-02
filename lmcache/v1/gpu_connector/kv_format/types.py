@@ -57,8 +57,10 @@ class LayoutHints(TypedDict, total=False):
             DSA: 3 ``latent, rope, dsa``). Values greater than 1 make
             ``normalize_and_discover_per_layer_formats`` regroup a flat
             per-plane registration list into per-layer tuples before format
-            classification. The default (1) leaves every existing
-            registration unchanged.
+            classification -- only that per-layer API regroups; the
+            single-format facade ``normalize_kv_and_discover_format`` does
+            not. The default (1) leaves every existing registration
+            unchanged.
     """
 
     kv_layout: KVLayoutName

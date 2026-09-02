@@ -50,7 +50,9 @@ def _synchronize_npu_stream_pointer(stream_ptr: int) -> None:
         raise RuntimeError(
             f"aclrtSynchronizeStream raised for stream {stream_ptr}"
         ) from exc
-    if isinstance(ret, int) and ret != 0:
+    # Some CANN binding versions return a NumPy scalar rather than a plain
+    # int; coerce so a non-zero error code is never mistaken for success.
+    if ret is not None and int(ret) != 0:
         raise RuntimeError(
             f"aclrtSynchronizeStream failed with error {ret} for stream {stream_ptr}"
         )
