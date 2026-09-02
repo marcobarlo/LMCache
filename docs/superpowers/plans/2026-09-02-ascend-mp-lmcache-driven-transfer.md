@@ -1865,3 +1865,72 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 - [ ] Upstream: `pre-commit run --files lmcache/v1/platform/npu/*.py tests/v1/platform/npu/*.py` (or `pre-commit run --all-files` if fast enough).
 - [ ] Plugin: full-suite gate above.
 - [ ] No changes outside `lmcache/v1/platform/npu/` (upstream) except new test files, the design doc, and the two plugin test files: `git diff --stat origin/dev...HEAD` after the work shows only those.
+
+---
+
+## Amendment (2026-09-02): Task 9 — B-lite upstream trio
+
+Approved by the user after Task 8 falsified the Phase-1 "fallback covers all
+formats" premise on 910B hardware. Three surgical, precedent-backed additions
+to upstream shared code, then Task 8's E2E finishes against them.
+
+### Task 9: NPU pointer views + MLA-tuple fallback transfer + planes-per-layer regroup
+
+**Files:**
+- Modify: `lmcache/v1/platform/torch_ops.py` (pointer view + transfer branch)
+- Modify: `lmcache/v1/gpu_connector/utils.py` (`LayoutHints.planes_per_layer`, regroup in `normalize_and_discover_per_layer_formats`)
+- Test: `tests/v1/platform/test_tensor_from_ptr.py` (extend or create), `tests/v1/platform/npu/test_npu_torch_ops_fallback.py`
+
+**Interfaces:**
+- Produces: `_tensor_from_npu_ptr(ptr, shape, dtype, device, total_bytes) -> torch.Tensor` (non-owning view, mirror of `_tensor_from_musa_ptr` using `torch._C._construct_storage_from_data_pointer`); `LayoutHints.planes_per_layer: int = 1`; regrouping of a flat per-layer tensor list into per-layer tuples when `planes_per_layer > 1`; a fallback dispatch branch for `EngineKVFormat.NL_X_TWO_X_NB_BS_HS` in `multi_layer_block_kv_transfer`.
+
+Steps (TDD each):
+
+1. `_tensor_from_npu_ptr`: add the NPU branch to `_tensor_from_ptr`'s dispatch
+   (`if device.type == "npu": return _tensor_from_npu_ptr(...)`) and the
+   helper, mirroring `_tensor_from_musa_ptr` line-for-line (same
+   `torch._C._construct_storage_from_data_pointer` construction, same
+   RuntimeError wrapping). Update the docstring's supported-device list.
+   Test (NPU-gated, cpu-skipped): build a small `npu` tensor, view it through
+   `_tensor_from_ptr(t.data_ptr(), t.shape, t.dtype, t.device)`, assert
+   `view.data_ptr() == t.data_ptr()` and a mutation through the view is
+   visible in `t`.
+
+2. `LayoutHints.planes_per_layer: int = 1` (dataclass field, default keeps
+   every existing caller unchanged). In
+   `normalize_and_discover_per_layer_formats`, when `planes_per_layer > 1`
+   and the discovered input is a flat list of tensors, regroup consecutive
+   `planes_per_layer` tensors into per-layer tuples before format
+   classification (engine-agnostic; detectors already classify tuple inputs).
+   Test (CPU-runnable): flat list of `2L` planes with unequal widths +
+   `LayoutHints(kv_layout="NHD", planes_per_layer=2)` classifies as
+   `NL_X_TWO_X_NB_BS_HS`; `planes_per_layer=3` with three unequal widths
+   classifies the same (DSA); default `1` leaves today's classification
+   untouched (reuse the fixtures of
+   `tests/v1/gpu_connector/test_kv_format_detection.py:179-205`).
+
+3. Fallback branch for `NL_X_TWO_X_NB_BS_HS` in
+   `torch_ops.multi_layer_block_kv_transfer`: new
+   `_transfer_per_layer_mla_tuple(layer_planes, object_tensors, block_ids,
+   n_block_ids, blocks_per_object, block_size, is_d2h,
+   skip_prefix_n_blocks)` where `layer_planes[l]` is the tuple of that
+   layer's `[NB, BS, W_p]` planes and the staging `object_tensors` are
+   rank-3 `[L, tokens, sum(W_p)]`. Per chunk, per layer, per plane `p` with
+   width `W_p` and slab offset `off_p = sum(W_q for q < p)`:
+   D2H — `sel = torch.index_select(plane, 0, eff_idx)` (shape
+   `[n_valid, BS, W_p]`), write
+   `obj[l, token_lo:token_hi, off_p:off_p + W_p].copy_(sel.reshape(-1, W_p))`;
+   H2D — the inverse `index_copy_` into each plane. Skip/valid-block logic
+   mirrors `_transfer_per_layer_mla` (`_valid_block_range_indices`,
+   `torch_ops.py:1557-1628`). `_normalize_paged_layers` must pass per-layer
+   plane tuples through for this format. Test (CPU-runnable): roundtrip D2H→
+   H2D with distinct values per (layer, plane, block) on CPU tensors through
+   `device_ops`-level `multi_layer_block_kv_transfer`, staging buffer shaped
+   `[L, tokens, Wl + Wr]`, asserting byte-exact both directions including
+   `skip_prefix_n_blocks > 0`.
+
+Commit: `[MP][Ascend] torch fallback: NPU pointer views, MLA-tuple transfer, plane regroup` (with trailer).
+
+Global constraints: same as plan header; the three changes are the ONLY
+shared-code edits sanctioned by the user's B-lite decision — anything beyond
+them goes back to the user.
