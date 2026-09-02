@@ -22,6 +22,39 @@ from lmcache.v1.platform.base.device_ops import DeviceOps
 logger = init_logger(__name__)
 
 
+def _synchronize_npu_stream_pointer(stream_ptr: int) -> None:
+    """Synchronize a raw NPU stream pointer through the CANN runtime.
+
+    Args:
+        stream_ptr: Raw ``aclrtStream`` handle.
+
+    Raises:
+        TypeError: If ``stream_ptr`` is not an int.
+        RuntimeError: If the acl runtime module is unavailable or reports
+            an error.
+    """
+    if not isinstance(stream_ptr, int):
+        raise TypeError("NPU stream pointer must be an int")
+    try:
+        # Third Party
+        from acl import rt as aclrt
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Unable to synchronize NPU stream pointer {stream_ptr}: "
+            "the acl runtime module is unavailable"
+        ) from exc
+    try:
+        ret = aclrt.synchronize_stream(stream_ptr)
+    except Exception as exc:
+        raise RuntimeError(
+            f"aclrtSynchronizeStream raised for stream {stream_ptr}"
+        ) from exc
+    if isinstance(ret, int) and ret != 0:
+        raise RuntimeError(
+            f"aclrtSynchronizeStream failed with error {ret} for stream {stream_ptr}"
+        )
+
+
 class NpuDeviceOps(DeviceOps):
     device_type: ClassVar[str] = "npu"
 
@@ -39,3 +72,57 @@ class NpuDeviceOps(DeviceOps):
             )
             return
         self.bind_native(native)
+
+    def record_completion_on_stream(
+        self,
+        stream_ptr: int,
+        kind: str,
+        payload: bytes,
+    ) -> None:
+        """Publish a completion only after prior NPU stream work finishes.
+
+        torch_npu does not expose the CUDA host-callback primitive used by
+        LMCache's native completion recorder. Synchronizing here preserves
+        the storage ownership contract until the plugin ships an async
+        callback backend (its native binding shadows this override via
+        ``bind_native``).
+
+        Args:
+            stream_ptr: Raw NPU stream pointer from the generic recorder path.
+            kind: Completion handler key.
+            payload: Encoded completion payload.
+
+        Raises:
+            RuntimeError: If the NPU stream cannot be synchronized.
+        """
+        _synchronize_npu_stream_pointer(stream_ptr)
+        super().record_completion_on_stream(0, kind, payload)
+
+    def record_event_on_stream(
+        self,
+        stream_ptr: int,
+        event_type_name: str,
+        session_id: str,
+        str_metadata: dict[str, str],
+        int_metadata: dict[str, int],
+    ) -> None:
+        """Record an event only after prior NPU stream work finishes.
+
+        Args:
+            stream_ptr: Raw NPU stream pointer from the generic recorder path.
+            event_type_name: Serialized event type.
+            session_id: Session associated with the event.
+            str_metadata: String-valued event metadata.
+            int_metadata: Integer-valued event metadata.
+
+        Raises:
+            RuntimeError: If the NPU stream cannot be synchronized.
+        """
+        _synchronize_npu_stream_pointer(stream_ptr)
+        super().record_event_on_stream(
+            0,
+            event_type_name,
+            session_id,
+            str_metadata,
+            int_metadata,
+        )
