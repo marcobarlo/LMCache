@@ -6,7 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 # Third Party
 import torch
@@ -16,6 +16,7 @@ from lmcache import torch_dev
 from lmcache.lmcache_native import EngineKVFormat
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_device,
@@ -282,7 +283,10 @@ class NpuCacheContext(BaseCacheContext):
         full_sw_kv: bool,
     ) -> None:
         """Initialize reconstructed tensors and NPU transfer resources."""
-        unwrapped = [wrapper.to_tensor() for wrapper in kv_caches]
+        unwrapped = cast(
+            DiscoverableKVCache,
+            [wrapper.to_tensor() for wrapper in kv_caches],
+        )
         discovered, engine_kv_formats = normalize_and_discover_per_layer_formats(
             unwrapped,
             engine_group_layer_indices(engine_group_infos),
@@ -314,7 +318,7 @@ class NpuCacheContext(BaseCacheContext):
         )
 
         super().__init__(
-            kv_caches=discovered,
+            kv_caches=cast(list[torch.Tensor], discovered),
             device=self.device_,
             num_layers=len(engine_kv_formats),
             kv_layer_groups_manager=kv_layer_groups_manager,
@@ -325,7 +329,7 @@ class NpuCacheContext(BaseCacheContext):
         self.group_kv_pointers_: list[torch.Tensor] = []
         for group_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
             pointers = get_group_data_ptrs(
-                self.kv_caches_,
+                cast(DiscoverableKVCache, self.kv_caches_),
                 self.get_engine_kv_format(group_idx),
                 group.layer_indices,
             )
