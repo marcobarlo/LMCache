@@ -26,6 +26,7 @@ from lmcache.v1.platform.npu.pin_memory import NpuPinMemoryBackend
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.platform.base.device_ops import DeviceOps
+    from lmcache.v1.platform.base.event_ipc import EventIPCBackend
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
 class NpuDeviceSpec(DeviceSpec):
     """Ascend NPU device specification for the detection registry."""
+
+    _event_backend_cache: "EventIPCBackend | None" = None
 
     @property
     def device_type(self) -> str:
@@ -53,6 +56,18 @@ class NpuDeviceSpec(DeviceSpec):
     @property
     def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
         return NpuPinMemoryBackend
+
+    @property
+    def event_ipc_backend(self) -> "EventIPCBackend":
+        """Return the cached torch_npu event IPC backend."""
+        backend = self._event_backend_cache
+        if backend is None:
+            # First Party
+            from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
+
+            backend = NpuEventIPCBackend()
+            self._event_backend_cache = backend
+        return backend
 
     def is_available(self) -> bool:
         """Check NPU availability without importing ``lmcache.__init__``.
