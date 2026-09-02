@@ -20,7 +20,6 @@ from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_device,
-    get_group_data_ptrs,
     normalize_and_discover_per_layer_formats,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
@@ -326,16 +325,11 @@ class NpuCacheContext(BaseCacheContext):
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
         )
 
-        self.group_kv_pointers_: list[torch.Tensor] = []
-        for group_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
-            pointers = get_group_data_ptrs(
-                cast(DiscoverableKVCache, self.kv_caches_),
-                self.get_engine_kv_format(group_idx),
-                group.layer_indices,
-            )
-            self.group_kv_pointers_.append(
-                torch.tensor(pointers, dtype=torch.int64, device=self.device_)
-            )
+        # The per-layer KV entries themselves (tensors, or tuples of plane
+        # tensors for the MLA/DSA format) double as the "pointer table" for
+        # the fallback transfer path -- see get_kernel_group_kv_pointers.
+        # They are read from kv_caches_ so close() releasing that list also
+        # releases these IPC-imported views.
 
         self._temp_buffer = _TempNpuBuffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
@@ -384,16 +378,34 @@ class NpuCacheContext(BaseCacheContext):
         """Return a host-callback stream adapter for shared MP code paths."""
         return self.host_callback_stream_
 
-    def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
-        """Return packed, process-local NPU pointers for a kernel group.
+    def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> Any:
+        """Return the per-layer KV plane views for a kernel group.
+
+        Unlike the CUDA/MUSA contexts this is NOT a device-resident int64
+        pointer table. The torch fallback that serves NPU transfers consumes
+        per-layer structures: a tuple of that layer's paged plane tensors for
+        the MLA/DSA tuple format (``NL_X_TWO_X_NB_BS_HS``, where per-plane
+        widths are not recoverable from a pointer table because
+        ``shape_desc.hs`` is the summed width), or the layer's single plane
+        tensor for the per-plane formats. The returned tensors are the
+        zero-copy IPC-imported views themselves, so the fallback reads and
+        writes the worker's paged buffers directly.
+
+        The Phase-2 native fast path
+        (:func:`lmcache.v1.multiprocess.modules.lmcache_driven_transfer.\
+_run_object_group_transfer_plan`)
+        must revisit this method if it needs a device-resident pointer table.
 
         Args:
             kernel_group_idx: Index of the requested kernel group.
 
         Returns:
-            A one-dimensional ``int64`` tensor in kernel order.
+            One entry per layer of the group, in kernel order: a tuple of
+            plane tensors per tuple-format layer, or the plane tensor per
+            per-plane-format layer.
         """
-        return self.group_kv_pointers_[kernel_group_idx]
+        group = self.kv_layer_groups_manager_.kernel_groups[kernel_group_idx]
+        return [self.kv_caches_[i] for i in group.layer_indices]
 
     def get_temp_kernel_group_buffer(
         self,
