@@ -17,6 +17,7 @@ from typing import ClassVar
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.platform import torch_ops
 from lmcache.v1.platform.base.device_ops import DeviceOps
 
 logger = init_logger(__name__)
@@ -72,6 +73,14 @@ class NpuDeviceOps(DeviceOps):
             )
             return
         self.bind_native(native)
+        # The plugin's c_ops re-exports torch-fallback symbols the compiled
+        # module lacks; instance-binding those would shadow the class-level
+        # stream-ordered overrides below (the storage ownership contract).
+        # Drop re-exports only: a genuine native implementation stays bound.
+        for name in ("record_completion_on_stream", "record_event_on_stream"):
+            bound = self.__dict__.get(name)
+            if bound is not None and bound is getattr(torch_ops, name, None):
+                del self.__dict__[name]
 
     def record_completion_on_stream(
         self,
@@ -84,8 +93,9 @@ class NpuDeviceOps(DeviceOps):
         torch_npu does not expose the CUDA host-callback primitive used by
         LMCache's native completion recorder. Synchronizing here preserves
         the storage ownership contract until the plugin ships an async
-        callback backend (its native binding shadows this override via
-        ``bind_native``).
+        callback backend: :meth:`ensure_native` keeps a genuine native
+        binding of this name in place while dropping torch-fallback
+        re-exports.
 
         Args:
             stream_ptr: Raw NPU stream pointer from the generic recorder path.
