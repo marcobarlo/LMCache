@@ -8,7 +8,7 @@
 # mypy: disable-error-code="union-attr,call-overload"
 # Standard
 from collections.abc import Hashable, Sequence
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, cast
 
 # Third Party
 import torch
@@ -212,6 +212,50 @@ def normalize_kv_and_discover_format(
     return detect_format(kv_caches, serving_engine, layout_hints)
 
 
+def _regroup_planes_per_layer(
+    kv_caches: "DiscoverableKVCache",
+    planes_per_layer: int,
+) -> "DiscoverableKVCache":
+    """Regroup a flat per-plane registration list into per-layer tuples.
+
+    Engines with tuple KV layouts (vLLM-Ascend MLA/DSA) may register their
+    paged planes as one flat tensor list (layer 0's planes, then layer 1's,
+    ...). Detection classifies per-layer tuple structures, so consecutive
+    ``planes_per_layer`` tensors are bundled into one tuple per layer
+    before classification. Any other input shape (a single tensor,
+    already-grouped tuples, nested lists) is returned unchanged.
+
+    Args:
+        kv_caches: The registered KV caches.
+        planes_per_layer: Planes per layer from the ``planes_per_layer``
+            layout hint; callers must pass a value greater than 1.
+
+    Returns:
+        The regrouped per-layer tuple list when ``kv_caches`` is a flat list
+        of tensors; ``kv_caches`` unchanged otherwise.
+
+    Raises:
+        ValueError: If the flat list length is not a multiple of
+            ``planes_per_layer``.
+    """
+    if not isinstance(kv_caches, list):
+        return kv_caches
+    if not all(isinstance(entry, torch.Tensor) for entry in kv_caches):
+        return kv_caches
+    if len(kv_caches) % planes_per_layer != 0:
+        raise ValueError(
+            f"planes_per_layer={planes_per_layer} does not divide the "
+            f"registered plane count ({len(kv_caches)}); a flat plane list "
+            "must contain a whole number of per-layer plane groups."
+        )
+    flat_planes = cast("list[torch.Tensor]", kv_caches)
+    regrouped: list[tuple[torch.Tensor, ...]] = [
+        tuple(flat_planes[i : i + planes_per_layer])
+        for i in range(0, len(flat_planes), planes_per_layer)
+    ]
+    return cast("DiscoverableKVCache", regrouped)
+
+
 def normalize_and_discover_per_layer_formats(
     kv_caches: "DiscoverableKVCache",
     layer_index_groups: "Sequence[Sequence[int]]",
@@ -231,13 +275,27 @@ def normalize_and_discover_per_layer_formats(
         layer_index_groups: Layer indices of each engine group (one inner
             sequence per group). Empty means a single non-hybrid group.
         serving_engine: Which serving engine produced the caches.
-        layout_hints: See :class:`LayoutHints`.
+        layout_hints: See :class:`LayoutHints`. When the
+            ``planes_per_layer`` hint is greater than 1 and ``kv_caches``
+            is a flat list of paged plane tensors, consecutive planes are
+            regrouped into per-layer tuples before classification.
 
     Returns:
         ``(normalized_kv_caches, engine_kv_formats)``: the canonical KV cache
         structure and one format per layer (length equals the layer count),
         ready for :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`.
+
+    Raises:
+        ValueError: If the ``planes_per_layer`` hint is not positive, or a
+            flat plane list length is not a multiple of it.
     """
+    planes_per_layer = (layout_hints or {}).get("planes_per_layer", 1)
+    if planes_per_layer < 1:
+        raise ValueError(
+            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
+        )
+    if planes_per_layer > 1:
+        kv_caches = _regroup_planes_per_layer(kv_caches, planes_per_layer)
 
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.

@@ -87,7 +87,7 @@ def _tensor_from_ptr(
     """
     Create a tensor view over a raw pointer (zero-copy where possible).
 
-    Supports CPU, CUDA, and MUSA device pointers.
+    Supports CPU, CUDA, MUSA, and NPU device pointers.
 
     Args:
         ptr:    Raw memory pointer as int (must be non-zero).
@@ -97,7 +97,9 @@ def _tensor_from_ptr(
                 - None / "cpu" / torch.device("cpu")  → CPU pointer
                 - "cuda" / "cuda:N" / torch.device("cuda", N) → CUDA pointer
                 - "musa" / "musa:N" / torch.device("musa", N) → MUSA pointer
-                  If None and ptr looks like a CUDA/MUSA ptr, pass device explicitly.
+                - "npu" / "npu:N" / torch.device("npu", N) → NPU pointer
+                  If None and ptr looks like a CUDA/MUSA/NPU ptr, pass device
+                  explicitly.
 
     Returns:
         A tensor that shares memory with the original pointer.
@@ -106,10 +108,12 @@ def _tensor_from_ptr(
                   (PyTorch >= 2.0) or __cuda_array_interface__, with a
                   cudaMemcpy D2D fallback.
         For MUSA: a non-owning view created from external device storage.
+        For NPU: a non-owning view created from external device storage.
 
     Raises:
         ValueError: if ptr is 0.
-        RuntimeError: If MUSA cannot construct a non-owning view for ``ptr``.
+        RuntimeError: If MUSA/NPU cannot construct a non-owning view for
+            ``ptr``.
 
     Warning:
         The caller is responsible for keeping the underlying memory alive
@@ -154,8 +158,15 @@ def _tensor_from_ptr(
     if device.type == "musa":
         return _tensor_from_musa_ptr(ptr, shape, dtype, device, total_bytes)
 
+    # ------------------------------------------------------------------ #
+    # NPU path                                                           #
+    # ------------------------------------------------------------------ #
+    if device.type == "npu":
+        return _tensor_from_npu_ptr(ptr, shape, dtype, device, total_bytes)
+
     raise ValueError(
-        f"Unsupported device type: {device.type!r}. Expected 'cpu', 'cuda', or 'musa'."
+        f"Unsupported device type: {device.type!r}. Expected 'cpu', 'cuda', "
+        "'musa', or 'npu'."
     )
 
 
@@ -293,6 +304,37 @@ def _tensor_from_musa_ptr(
     except Exception as exc:
         raise RuntimeError(
             "TorchMUSA failed to construct a non-owning tensor from a device pointer"
+        ) from exc
+
+
+# ====================================================================== #
+#  NPU implementation                                                    #
+# ====================================================================== #
+def _tensor_from_npu_ptr(
+    ptr: int,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    total_bytes: int,
+) -> torch.Tensor:
+    """Create a non-owning NPU tensor from a raw device pointer.
+
+    The returned tensor aliases ``ptr``. A copy fallback is intentionally not
+    provided because writes through a copied tensor would not update the
+    original paged buffer.
+    """
+    try:
+        storage = torch._C._construct_storage_from_data_pointer(
+            ptr,
+            device,
+            total_bytes,
+        )
+        tensor = torch.empty(0, dtype=dtype, device=storage.device)
+        tensor.set_(storage, 0, shape, _contiguous_element_strides(shape))
+        return tensor
+    except Exception as exc:
+        raise RuntimeError(
+            "TorchNPU failed to construct a non-owning tensor from a device pointer"
         ) from exc
 
 
@@ -926,6 +968,8 @@ def _normalize_paged_layers(
         - ``list[list[torch.Tensor]]`` (2 x NL) for SGLang MHA formats.
         - ``list[(torch.Tensor, torch.Tensor)]`` (NL ``(K, V)`` pairs) for the
           per-layer tuple format (``NL_X_TWO_X_NB_BS_NH_HS``).
+        - ``list[tuple[torch.Tensor, ...]]`` (NL plane tuples of 2 MLA or 3
+          DSA ``[NB, BS, 1, W]`` tensors) for ``NL_X_TWO_X_NB_BS_HS``.
         - ``list[torch.Tensor]`` (per-layer) for all other formats.
     """
     if is_cross_layer(engine_kv_format):
@@ -1009,9 +1053,13 @@ def _normalize_paged_layers(
             "got: " + type(paged_buffer_ptrs_tensor).__name__
         )
     if _is_kv_second_tuple_format(engine_kv_format):
+        # NL_X_TWO_X_NB_BS_HS carries MLA (latent, rope) or DSA
+        # (latent, rope, dsa) plane tuples of any length >= 2; every other
+        # tuple format is an exact (K, V) pair.
+        is_mla_plane_tuple = engine_kv_format == EngineKVFormat.NL_X_TWO_X_NB_BS_HS
         if isinstance(paged_buffer_ptrs_tensor, list) and all(
             isinstance(t, (list, tuple))
-            and len(t) == 2
+            and (len(t) >= 2 if is_mla_plane_tuple else len(t) == 2)
             and all(isinstance(x, torch.Tensor) for x in t)
             for t in paged_buffer_ptrs_tensor
         ):
@@ -1217,6 +1265,19 @@ def multi_layer_block_kv_transfer(
             blocks_per_object,
             block_size,
             engine_kv_format,
+            is_d2h,
+            skip_prefix_n_blocks,
+        )
+    elif engine_kv_format == EngineKVFormat.NL_X_TWO_X_NB_BS_HS:
+        # Must precede the generic MLA branch: is_mla() is also true for the
+        # plane-tuple format, whose per-layer entries are tuples, not tensors.
+        _transfer_per_layer_mla_tuple(
+            normalized,
+            object_tensors,
+            block_ids,
+            n_block_ids,
+            blocks_per_object,
+            block_size,
             is_d2h,
             skip_prefix_n_blocks,
         )
@@ -1626,6 +1687,72 @@ def _transfer_per_layer_mla(
                 else:
                     src_blocks = src.reshape(n_valid, block_size, hidden_size)
                     layer.index_copy_(0, eff_idx, src_blocks)
+
+
+def _transfer_per_layer_mla_tuple(
+    layer_planes: "list[tuple[torch.Tensor, ...] | list[torch.Tensor]]",
+    object_tensors: list[torch.Tensor],
+    block_ids: torch.Tensor | list[int],
+    n_block_ids: int,
+    blocks_per_object: int,
+    block_size: int,
+    is_d2h: bool,
+    skip_prefix_n_blocks: int,
+) -> None:
+    """Handle the MLA/DSA plane-tuple format: NL x planes x [NB, BS, 1, W_p].
+
+    Each layer arrives as a tuple of paged planes (MLA: ``latent, rope``;
+    DSA: ``latent, rope, dsa``). The staging objects are rank-3
+    ``[L, tokens, sum(W_p)]``: plane ``p`` of layer ``l`` occupies the
+    column slab ``[sum(W_q for q < p) : sum(W_q for q <= p)]``. Valid-block
+    and skip handling mirror :func:`_transfer_per_layer_mla`.
+    """
+    if not layer_planes or not object_tensors:
+        return
+
+    target_device = layer_planes[0][0].device
+    block_ids_dev = torch.as_tensor(block_ids, dtype=torch.long, device=target_device)
+
+    for object_idx, obj in enumerate(object_tensors):
+        valid = _valid_block_range_indices(
+            object_idx,
+            n_block_ids,
+            blocks_per_object,
+            block_size,
+            skip_prefix_n_blocks,
+        )
+        if valid is None:
+            continue
+        idx_start, idx_end, offset_in_object = valid
+        n_valid = idx_end - idx_start
+        token_end = offset_in_object + n_valid * block_size
+        eff_idx = block_ids_dev[idx_start:idx_end]
+
+        if is_d2h:
+            for layer_idx, planes in enumerate(layer_planes):
+                slab_offset = 0
+                for plane in planes:
+                    width = int(plane.shape[-1])
+                    # [n_valid, BS, ..., W_p] -> [n_valid * BS, W_p]
+                    selected = torch.index_select(plane, 0, eff_idx).reshape(-1, width)
+                    token_rows = obj[layer_idx, offset_in_object:token_end]
+                    token_rows[:, slab_offset : slab_offset + width].copy_(
+                        selected, non_blocking=True
+                    )
+                    slab_offset += width
+        else:
+            chunk_gpu = obj[:, offset_in_object:token_end].to(
+                target_device, non_blocking=True
+            )
+            for layer_idx, planes in enumerate(layer_planes):
+                slab_offset = 0
+                for plane in planes:
+                    width = int(plane.shape[-1])
+                    src = chunk_gpu[layer_idx][
+                        :, slab_offset : slab_offset + width
+                    ].reshape(n_valid, *plane.shape[1:])
+                    plane.index_copy_(0, eff_idx, src)
+                    slab_offset += width
 
 
 def _transfer_per_layer_hnd(
