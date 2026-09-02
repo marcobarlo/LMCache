@@ -88,3 +88,67 @@ def test_temp_buffer_object_group_view_is_contiguous_union() -> None:
     flat = buffer.get_temp_object_group_buffer(1, 0)
     assert kg0.data_ptr() == flat.data_ptr()
     assert buffer.max_batch_size == 2
+
+
+def test_close_synchronizes_before_releasing_ipc_owners() -> None:
+    """Context close waits for transfers, releases owners, and is idempotent."""
+    # First Party
+    from lmcache.v1.platform.npu.cache_context import NpuCacheContext
+
+    calls: list[str] = []
+
+    class _Stream:
+        def synchronize(self) -> None:
+            calls.append("synchronize")
+
+    class _Wrapper:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(self.name)
+
+    class _TestContext(NpuCacheContext):
+        def __init__(self) -> None:
+            self.stream_ = _Stream()  # type: ignore[assignment]
+            self._ipc_wrappers = (  # type: ignore[assignment]
+                _Wrapper("first"),
+                _Wrapper("second"),
+            )
+
+    context = _TestContext()
+
+    context.close()
+    context.close()
+
+    assert calls == ["synchronize", "first", "second"]
+
+
+def test_device_spec_creates_npu_cache_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The spec hook constructs NpuCacheContext with forwarded arguments."""
+    # First Party
+    from lmcache.v1.platform.npu import NpuDeviceSpec
+    from lmcache.v1.platform.npu import cache_context as npu_cache_context
+
+    class _Sentinel:
+        pass
+
+    created: dict[str, object] = {}
+
+    def _fake_init(
+        self: object,
+        kv_caches: object,
+        lmcache_tokens_per_chunk: int = 256,
+        **kwargs: object,
+    ) -> None:
+        created["kv_caches"] = kv_caches
+        created["chunk"] = lmcache_tokens_per_chunk
+
+    monkeypatch.setattr(npu_cache_context.NpuCacheContext, "__init__", _fake_init)
+    spec = NpuDeviceSpec()
+    context = spec.create_cache_context([_Sentinel()], 128)
+    assert isinstance(context, npu_cache_context.NpuCacheContext)
+    assert isinstance(created["kv_caches"], list)
+    assert created["chunk"] == 128

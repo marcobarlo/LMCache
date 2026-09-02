@@ -5,18 +5,31 @@
 from __future__ import annotations
 
 # Standard
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 # Third Party
 import torch
 
 # First Party
+from lmcache import torch_dev
 from lmcache.lmcache_native import EngineKVFormat
 from lmcache.logging import init_logger
-from lmcache.v1.gpu_connector.utils import (  # noqa: F401 — used by NpuCacheContext
+from lmcache.utils import EngineType
+from lmcache.v1.gpu_connector.utils import (
+    LayoutHints,
+    get_device,
     get_group_data_ptrs,
+    normalize_and_discover_per_layer_formats,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+from lmcache.v1.multiprocess.custom_types import KVCache
+from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
 
@@ -212,3 +225,234 @@ class _TempNpuBuffer:
             self._get_size_for_object_group(object_group_idx)
             for object_group_idx in range(self._kv_groups_manager.num_object_groups)
         )
+
+
+class NpuCacheContext(BaseCacheContext):
+    """Cache context for NPU-backed KV tensors in MP handle mode."""
+
+    device_type = "npu"
+
+    def __init__(
+        self,
+        kv_caches: KVCache,
+        lmcache_tokens_per_chunk: int = 256,
+        layout_hints: LayoutHints | None = None,
+        engine_group_infos: Sequence[EngineGroupInfo] = (),
+        engine_type: EngineType = EngineType.VLLM,
+        separate_object_groups: bool = False,
+        full_sw_kv: bool = False,
+    ) -> None:
+        """Build an NPU cache context from IPC-wrapped KV tensors.
+
+        Args:
+            kv_caches: NPU IPC wrappers received during server registration.
+            lmcache_tokens_per_chunk: Tokens per LMCache object.
+            layout_hints: Optional KV layout hints from the serving engine.
+            engine_group_infos: Engine-neutral group metadata.
+            engine_type: Serving engine that produced the KV cache.
+            separate_object_groups: Whether to split object groups by window.
+            full_sw_kv: Whether sliding-window groups transfer their full KV.
+
+        Raises:
+            ValueError: If reconstructed tensors are not NPU tensors.
+        """
+        self._ipc_wrappers: tuple[Any, ...] = tuple(kv_caches)
+        try:
+            self._initialize(
+                kv_caches,
+                lmcache_tokens_per_chunk,
+                layout_hints,
+                engine_group_infos,
+                engine_type,
+                separate_object_groups,
+                full_sw_kv,
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(
+        self,
+        kv_caches: KVCache,
+        lmcache_tokens_per_chunk: int,
+        layout_hints: LayoutHints | None,
+        engine_group_infos: Sequence[EngineGroupInfo],
+        engine_type: EngineType,
+        separate_object_groups: bool,
+        full_sw_kv: bool,
+    ) -> None:
+        """Initialize reconstructed tensors and NPU transfer resources."""
+        unwrapped = [wrapper.to_tensor() for wrapper in kv_caches]
+        discovered, engine_kv_formats = normalize_and_discover_per_layer_formats(
+            unwrapped,
+            engine_group_layer_indices(engine_group_infos),
+            engine_type,
+            layout_hints,
+        )
+        if not isinstance(discovered, list):
+            raise ValueError("NpuCacheContext requires a list-based KV layout")
+        self.device_ = get_device(discovered)
+        if self.device_.type != "npu":
+            raise ValueError(
+                f"NpuCacheContext expected NPU tensors, got {self.device_.type!r}"
+            )
+
+        kv_layer_groups_manager = KVLayerGroupsManager(
+            discovered,
+            engine_kv_formats=engine_kv_formats,
+            engine_group_infos=engine_group_infos,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+            separate_object_groups=separate_object_groups,
+        )
+        if full_sw_kv:
+            kv_layer_groups_manager.enable_full_sw_kv()
+
+        block_ids_buffer = torch.empty(
+            1 << 20,
+            dtype=torch.long,
+            device=self.device_,
+        )
+
+        super().__init__(
+            kv_caches=discovered,
+            device=self.device_,
+            num_layers=len(engine_kv_formats),
+            kv_layer_groups_manager=kv_layer_groups_manager,
+            block_ids_buffer=block_ids_buffer,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+        )
+
+        self.group_kv_pointers_: list[torch.Tensor] = []
+        for group_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
+            pointers = get_group_data_ptrs(
+                self.kv_caches_,
+                self.get_engine_kv_format(group_idx),
+                group.layer_indices,
+            )
+            self.group_kv_pointers_.append(
+                torch.tensor(pointers, dtype=torch.int64, device=self.device_)
+            )
+
+        self._temp_buffer = _TempNpuBuffer(
+            kv_layer_groups_manager=self.kv_layer_groups_manager_,
+            lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
+            device=self.device_,
+            max_batch_size=4,
+        )
+        self.stream_ = torch_dev.Stream(device=self.device_)
+        self.host_callback_stream_ = _NpuHostCallbackStream(self.stream_)
+
+        logger.debug(
+            "NpuCacheContext: %d layers, %d blocks, dtype=%s",
+            self.num_layers_,
+            self.num_blocks,
+            self.kv_layer_groups_manager_.kernel_groups[0].dtype,
+        )
+
+    def close(self) -> None:
+        """Synchronize transfers and release receiver-side IPC owners."""
+        wrappers = self._ipc_wrappers
+        if not wrappers:
+            return
+
+        stream = getattr(self, "stream_", None)
+        synchronize = getattr(stream, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+
+        kv_tensors = getattr(self, "kv_caches_", None)
+        if isinstance(kv_tensors, list):
+            kv_tensors.clear()
+
+        for wrapper in wrappers:
+            close = getattr(wrapper, "close", None)
+            if callable(close):
+                close()
+        self._ipc_wrappers = ()
+
+    @property
+    def stream(self) -> Any:
+        """Return the NPU stream used for transfer work."""
+        return self.stream_
+
+    @property
+    def cupy_stream(self) -> _NpuHostCallbackStream:
+        """Return a host-callback stream adapter for shared MP code paths."""
+        return self.host_callback_stream_
+
+    def get_kernel_group_kv_pointers(self, kernel_group_idx: int) -> torch.Tensor:
+        """Return packed, process-local NPU pointers for a kernel group.
+
+        Args:
+            kernel_group_idx: Index of the requested kernel group.
+
+        Returns:
+            A one-dimensional ``int64`` tensor in kernel order.
+        """
+        return self.group_kv_pointers_[kernel_group_idx]
+
+    def get_temp_kernel_group_buffer(
+        self,
+        batch_idx: int,
+        kernel_group_idx: int,
+    ) -> torch.Tensor:
+        """Return the NPU staging buffer for a batch/kernel-group pair.
+
+        Args:
+            batch_idx: Index within the current transfer batch.
+            kernel_group_idx: Index of the kernel group to transfer.
+
+        Returns:
+            A typed view into the NPU staging allocation.
+        """
+        return self._temp_buffer.get_temp_kernel_group_buffer(
+            batch_idx,
+            kernel_group_idx,
+        )
+
+    @property
+    def max_batch_size(self) -> int:
+        """Return the maximum number of chunks transferred per batch."""
+        return self._temp_buffer.max_batch_size
+
+    def get_temp_object_group_buffer(
+        self,
+        batch_idx: int,
+        object_group_idx: int,
+    ) -> torch.Tensor:
+        """Return the NPU staging buffer for a batch/object-group pair.
+
+        Args:
+            batch_idx: Index within the current transfer batch.
+            object_group_idx: Index of the object group to transfer.
+
+        Returns:
+            A flat view covering the object's NPU staging allocation.
+        """
+        return self._temp_buffer.get_temp_object_group_buffer(
+            batch_idx,
+            object_group_idx,
+        )
+
+    def get_kernel_group_shape_dtype(
+        self,
+        num_tokens: int,
+        kernel_group_idx: int,
+    ) -> tuple[torch.Size, torch.dtype]:
+        """Return the shape and dtype for a kernel-group allocation.
+
+        Args:
+            num_tokens: Number of tokens represented by the allocation.
+            kernel_group_idx: Index of the kernel group.
+
+        Returns:
+            The allocation shape and element dtype.
+        """
+        return self._temp_buffer.get_kernel_group_shape_dtype(
+            num_tokens,
+            kernel_group_idx,
+        )
+
+    def cache_size_per_token(self) -> int:
+        """Return total cache bytes per logical token across all groups."""
+        return self._temp_buffer.get_cache_size_per_token()
