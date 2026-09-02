@@ -343,6 +343,136 @@ def test_mla_tuple_block_kv_transfer_roundtrip(
 
 
 # ====================================================================== #
+#  _normalize_lmcache_objects: pointer mode follows the transfer device   #
+# ====================================================================== #
+
+
+def _mla_shape_desc(
+    num_layers: int, chunk_tokens: int, width_sum: int
+) -> PageBufferShapeDesc:
+    """Minimal MLA-family shape desc for pointer-mode reconstruction."""
+    shape_desc = PageBufferShapeDesc()
+    shape_desc.nl = num_layers
+    shape_desc.nb = 1
+    shape_desc.bs = chunk_tokens
+    shape_desc.nh = 1
+    shape_desc.hs = width_sum
+    shape_desc.kv_size = 1
+    shape_desc.element_size = 4
+    shape_desc.dtype = torch.float32
+    return shape_desc
+
+
+@pytest.mark.parametrize("device", [None, "cpu"], ids=["default", "explicit_cpu"])
+def test_normalize_lmcache_objects_pointer_mode_stays_cpu(device: object) -> None:
+    """Pointer mode with no/explicit CPU device keeps aliasing CPU memory."""
+    chunk = torch.zeros(3, 8, 6, dtype=torch.float32)
+    tensors = _py_ops._normalize_lmcache_objects(
+        [chunk.data_ptr()],
+        shape_desc=_mla_shape_desc(3, 8, 6),
+        lmcache_chunk_size=8,
+        engine_kv_format=F.NL_X_NB_BS_HS,
+        dtype=torch.float32,
+        device=device,
+    )
+    assert len(tensors) == 1
+    assert tensors[0].device.type == "cpu"
+    assert tuple(tensors[0].shape) == (3, 8, 6)
+    # Byte-identical aliasing: writes through the view reach the original.
+    tensors[0][0, 0, 0] = 7.0
+    assert chunk[0, 0, 0] == 7.0
+
+
+def test_normalize_lmcache_objects_pointer_mode_honors_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pointer mode reconstructs on the caller's device, not hard-coded CPU."""
+
+    class FakeDevice:
+        def __init__(self, value: object) -> None:
+            self.type = str(value).split(":", maxsplit=1)[0]
+
+    captured: dict[str, object] = {}
+
+    def fake_npu_ptr(
+        ptr: int,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: Any,
+        total_bytes: int,
+    ) -> torch.Tensor:
+        captured.update(
+            ptr=ptr,
+            shape=shape,
+            dtype=dtype,
+            device_type=device.type,
+            total_bytes=total_bytes,
+        )
+        return torch.empty(shape, dtype=dtype)
+
+    monkeypatch.setattr(_py_ops.torch, "device", FakeDevice)
+    monkeypatch.setattr(_py_ops, "_tensor_from_npu_ptr", fake_npu_ptr)
+
+    buffer = torch.zeros(3 * 8 * 6, dtype=torch.float32)
+    tensors = _py_ops._normalize_lmcache_objects(
+        [buffer.data_ptr()],
+        shape_desc=_mla_shape_desc(3, 8, 6),
+        lmcache_chunk_size=8,
+        engine_kv_format=F.NL_X_NB_BS_HS,
+        dtype=torch.float32,
+        device="npu:0",
+    )
+
+    assert captured == {
+        "ptr": buffer.data_ptr(),
+        "shape": (3, 8, 6),
+        "dtype": torch.float32,
+        "device_type": "npu",
+        "total_bytes": 3 * 8 * 6 * 4,
+    }
+    assert len(tensors) == 1
+
+
+def test_block_transfer_pointer_mode_objects_roundtrip_cpu() -> None:
+    """Through the facade, pointer-mode CPU objects stay byte-identical."""
+    num_layers, num_blocks, block_size = 3, 5, 4
+    chunk_tokens = 8
+    blocks_per_object = chunk_tokens // block_size
+    block_ids = [3, 1, 4, 0]
+    widths = (6, 2)
+
+    ops = resolve_device_ops("cpu")
+    planes = _make_tuple_planes(num_layers, num_blocks, block_size, widths)
+    width_sum = sum(widths)
+    shape_desc = _mla_shape_desc(num_layers, chunk_tokens, width_sum)
+    shape_desc.nb = num_blocks
+    shape_desc.bs = block_size
+
+    chunks = [
+        torch.zeros(num_layers, chunk_tokens, width_sum, dtype=torch.float32)
+        for _ in range(len(block_ids) // blocks_per_object)
+    ]
+    ops.multi_layer_block_kv_transfer(
+        planes,
+        [chunk.data_ptr() for chunk in chunks],
+        block_ids,
+        "cpu",
+        lmcache_native.TransferDirection.D2H,
+        shape_desc,
+        chunk_tokens,
+        F.NL_X_TWO_X_NB_BS_HS,
+        0,
+    )
+    expected_chunks = _expected_d2h_chunks(
+        planes, block_ids, chunk_tokens, blocks_per_object, block_size, 0
+    )
+    for object_idx, chunk in enumerate(chunks):
+        assert torch.equal(chunk, expected_chunks[object_idx]), (
+            f"pointer-mode D2H chunk {object_idx} differs from tensor mode"
+        )
+
+
+# ====================================================================== #
 #  normalize_and_discover_per_layer_formats: planes_per_layer regroup     #
 # ====================================================================== #
 
