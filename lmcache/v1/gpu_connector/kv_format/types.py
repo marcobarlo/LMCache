@@ -54,13 +54,14 @@ class LayoutHints(TypedDict, total=False):
         head_dim: Per-head dimension. Used by TRT-LLM (same).
         planes_per_layer: Number of paged plane tensors registered per layer
             for tuple KV layouts (vLLM-Ascend MLA: 2 ``latent, rope``;
-            DSA: 3 ``latent, rope, dsa``). Values greater than 1 make
+            DSA: 3 ``latent, rope, dsa``). An ``int`` greater than 1 makes
             ``normalize_and_discover_per_layer_formats`` regroup a flat
-            per-plane registration list into per-layer tuples before format
-            classification -- only that per-layer API regroups; the
-            single-format facade ``normalize_kv_and_discover_format`` does
-            not. The default (1) leaves every existing registration
-            unchanged.
+            per-plane registration list into uniform per-layer tuples. A
+            ``list[int]`` is a per-layer arity for mixed 1-/N-plane
+            registrations; arity-1 slices unwrap to a bare tensor. The
+            default (1) leaves every existing registration unchanged.
+            Only that per-layer API regroups; the single-format facade
+            ``normalize_kv_and_discover_format`` does not.
     """
 
     kv_layout: KVLayoutName
@@ -68,4 +69,4 @@ class LayoutHints(TypedDict, total=False):
     tokens_per_block: int
     kv_list_layout: Literal["k_v"]
     head_dim: int
-    planes_per_layer: int
+    planes_per_layer: int | list[int]

@@ -59,31 +59,35 @@ def flatten_kv_cache_values(
 
 def planes_per_layer(
     kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> int:
-    """Return the uniform per-layer plane arity of ``kv_caches``.
+) -> int | list[int]:
+    """Return the per-layer plane arity of ``kv_caches``.
 
     Args:
         kv_caches: Mapping from layer name to tensor or per-layer tuple.
 
     Returns:
-        The tuple arity when every layer value is a tuple of the same
-        arity greater than one; otherwise ``1``. Mixed or arity-1 layouts
-        return ``1`` so the server-side detection surfaces the structure
-        it actually receives instead of guessing.
+        A single ``int`` when every layer has the same arity (``1`` for
+        bare tensors / arity-1 lists, ``N`` for uniform N-plane tuples).
+        A ``list[int]`` when arities mix (e.g. 1-plane SWA + 2-plane MLA),
+        one count per dict key in registration order.
     """
     if not kv_caches:
         return 1
-    values = list(kv_caches.values())
-    if not all(isinstance(value, (tuple, list)) for value in values):
+    counts: list[int] = []
+    for value in kv_caches.values():
+        if isinstance(value, torch.Tensor):
+            counts.append(1)
+        else:
+            counts.append(len(value))
+    unique = set(counts)
+    if unique == {1}:
         return 1
-    arities = {len(value) for value in values}
-    if len(arities) != 1:
-        return 1
-    arity = arities.pop()
-    return arity if arity > 1 else 1
+    if len(unique) == 1:
+        return unique.pop()
+    return counts
 
 
-def with_planes_per_layer(hints: Any, planes: int) -> Any:
+def with_planes_per_layer(hints: Any, planes: int | list[int]) -> Any:
     """Merge a derived plane arity into layout hints.
 
     Hints are a plain dict / ``LayoutHints`` TypedDict at runtime; engines
@@ -91,14 +95,21 @@ def with_planes_per_layer(hints: Any, planes: int) -> Any:
 
     Args:
         hints: The existing layout hints (dict / LayoutHints).
-        planes: The derived per-layer plane arity.
+        planes: The derived per-layer plane arity (uniform ``int`` or a
+            mixed-arity ``list[int]``).
 
     Returns:
-        A new dict carrying ``planes_per_layer`` when ``planes > 1`` and the
-        hints do not already set it; the input otherwise (including for any
-        non-dict hints object, which is passed through untouched).
+        A new dict carrying ``planes_per_layer`` when the arity is not the
+        default ``1`` and the hints do not already set it; the input
+        otherwise (including for any non-dict hints object, which is
+        passed through untouched).
     """
-    if planes <= 1 or not isinstance(hints, dict):
+    if not isinstance(hints, dict):
+        return hints
+    if isinstance(planes, int):
+        if planes <= 1:
+            return hints
+    elif all(n == 1 for n in planes):
         return hints
     if hints.get("planes_per_layer", 1) == 1:
         merged = dict(hints)

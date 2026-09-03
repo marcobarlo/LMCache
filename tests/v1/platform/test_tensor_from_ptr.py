@@ -342,6 +342,129 @@ def test_mla_tuple_block_kv_transfer_roundtrip(
             )
 
 
+@pytest.mark.parametrize("skip", [0, 1], ids=["no_skip", "skip_one"])
+def test_mla_tuple_mixed_dtype_block_kv_transfer_roundtrip(skip: int) -> None:
+    """int8 latent + float16 scale packs by bytes, not element widths."""
+    num_layers, num_blocks, block_size = 1, 5, 4
+    chunk_tokens = 8
+    blocks_per_object = chunk_tokens // block_size
+    block_ids = [3, 1, 4, 0]
+    latent_w, scale_w = 8, 1
+    hidden_bytes = latent_w * 1 + scale_w * 2
+
+    ops = resolve_device_ops("cpu")
+    planes: list[tuple[torch.Tensor, ...]] = []
+    for layer_idx in range(num_layers):
+        latent = torch.arange(
+            num_blocks * block_size * latent_w, dtype=torch.int8
+        ).reshape(num_blocks, block_size, 1, latent_w)
+        # Values that would truncate if packed as a single int8 column.
+        scale = (
+            torch.arange(num_blocks * block_size, dtype=torch.float16) * 0.5
+            + torch.tensor(1.25, dtype=torch.float16)
+        ).reshape(num_blocks, block_size, 1, scale_w)
+        planes.append((latent, scale))
+
+    shape_desc = PageBufferShapeDesc()
+    shape_desc.nl = num_layers
+    shape_desc.nb = num_blocks
+    shape_desc.bs = block_size
+    shape_desc.nh = 1
+    shape_desc.hs = hidden_bytes
+    shape_desc.kv_size = 1
+    shape_desc.element_size = 1
+    shape_desc.dtype = torch.int8
+
+    chunks = [
+        torch.zeros(num_layers, chunk_tokens, hidden_bytes, dtype=torch.int8)
+        for _ in range(len(block_ids) // blocks_per_object)
+    ]
+    ops.multi_layer_block_kv_transfer(
+        planes,
+        chunks,
+        block_ids,
+        "cpu",
+        lmcache_native.TransferDirection.D2H,
+        shape_desc,
+        chunk_tokens,
+        F.NL_X_TWO_X_NB_BS_HS,
+        skip,
+    )
+    expected_chunks = _expected_mixed_dtype_d2h_chunks(
+        planes, block_ids, chunk_tokens, blocks_per_object, block_size, skip
+    )
+    for object_idx, chunk in enumerate(chunks):
+        assert torch.equal(chunk.view(torch.uint8), expected_chunks[object_idx]), (
+            f"D2H mixed-dtype chunk {object_idx} mismatch (skip={skip})"
+        )
+
+    target_planes = [
+        tuple(torch.zeros_like(plane) for plane in layer) for layer in planes
+    ]
+    ops.multi_layer_block_kv_transfer(
+        target_planes,
+        chunks,
+        block_ids,
+        "cpu",
+        lmcache_native.TransferDirection.H2D,
+        shape_desc,
+        chunk_tokens,
+        F.NL_X_TWO_X_NB_BS_HS,
+        skip,
+    )
+    expected_planes = _expected_h2d_planes(planes, block_ids, skip)
+    for layer_idx, (got, exp) in enumerate(
+        zip(target_planes, expected_planes, strict=True)
+    ):
+        for plane_idx, (got_plane, exp_plane) in enumerate(zip(got, exp, strict=True)):
+            assert torch.equal(got_plane, exp_plane), (
+                f"H2D mixed-dtype mismatch layer={layer_idx} plane={plane_idx} "
+                f"(skip={skip})"
+            )
+
+
+def _expected_mixed_dtype_d2h_chunks(
+    planes: list[tuple[torch.Tensor, ...]],
+    block_ids: list[int],
+    chunk_tokens: int,
+    blocks_per_object: int,
+    block_size: int,
+    skip_prefix_n_blocks: int,
+) -> torch.Tensor:
+    """Byte-packed expected chunks for mixed-item-size MLA planes."""
+    num_layers = len(planes)
+    num_objects = (len(block_ids) + blocks_per_object - 1) // blocks_per_object
+    hidden_bytes = sum(
+        int(p.shape[-1]) * int(p.element_size()) for p in planes[0]
+    )
+    expected = torch.zeros(
+        num_objects, num_layers, chunk_tokens, hidden_bytes, dtype=torch.uint8
+    )
+    for object_idx in range(num_objects):
+        flat_start = max(object_idx * blocks_per_object, skip_prefix_n_blocks)
+        flat_end = min(
+            object_idx * blocks_per_object + blocks_per_object, len(block_ids)
+        )
+        token = (flat_start - object_idx * blocks_per_object) * block_size
+        for flat_idx in range(flat_start, flat_end):
+            for layer_idx, layer_planes in enumerate(planes):
+                byte_off = 0
+                dst = expected[object_idx, layer_idx, token : token + block_size]
+                for plane in layer_planes:
+                    width = int(plane.shape[-1])
+                    nbytes = width * int(plane.element_size())
+                    packed = (
+                        plane[block_ids[flat_idx]]
+                        .contiguous()
+                        .view(torch.uint8)
+                        .view(block_size, nbytes)
+                    )
+                    dst[:, byte_off : byte_off + nbytes] = packed
+                    byte_off += nbytes
+            token += block_size
+    return expected
+
+
 # ====================================================================== #
 #  _normalize_lmcache_objects: pointer mode follows the transfer device   #
 # ====================================================================== #
@@ -562,3 +685,27 @@ def test_regroup_rejects_indivisible_plane_count() -> None:
             EngineType.VLLM,
             {"kv_layout": "NHD", "planes_per_layer": 2},
         )
+
+
+def test_regroup_mixed_arity_list_pairs_mla_and_unwraps_swa() -> None:
+    """A mixed 1-/2-plane flat list regroups by per-layer arity."""
+    swa0 = _plane(HS * 8)
+    lat = _plane(HS * 8)
+    scale = _plane(HS)
+    swa1 = _plane(HS * 8)
+    normalized, formats = normalize_and_discover_per_layer_formats(
+        [swa0, lat, scale, swa1],
+        [],
+        EngineType.VLLM,
+        {"kv_layout": "NHD", "planes_per_layer": [1, 2, 1]},
+    )
+    assert len(normalized) == 3
+    assert formats[0] == F.NL_X_NB_BS_NH_CS
+    assert formats[1] == F.NL_X_TWO_X_NB_BS_HS
+    assert formats[2] == F.NL_X_NB_BS_NH_CS
+    assert normalized[0].data_ptr() == swa0.data_ptr()
+    assert tuple(p.data_ptr() for p in normalized[1]) == (
+        lat.data_ptr(),
+        scale.data_ptr(),
+    )
+    assert normalized[2].data_ptr() == swa1.data_ptr()

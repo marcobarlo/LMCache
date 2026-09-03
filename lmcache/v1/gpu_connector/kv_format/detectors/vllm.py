@@ -102,6 +102,28 @@ class VLLM_Detector(EngineDetector):
         if list_depth == 2 and tensor_ndim == 4:
             planes0 = kv_caches[0]
             if isinstance(planes0, (tuple, list)):
+                # Per-layer 1-element lists of 4-D single-head planes
+                # (vLLM-Ascend compressor / state / SWA pages). Unwrap to
+                # the inner tensors so the rank-4 fused-content formats apply.
+                if (
+                    len(planes0) == 1
+                    and isinstance(planes0[0], torch.Tensor)
+                    and int(first_tensor.shape[2]) == 1
+                    and all(
+                        isinstance(entry, (tuple, list)) and len(entry) == 1
+                        for entry in kv_caches
+                    )
+                ):
+                    unwrapped = [entry[0] for entry in kv_caches]
+                    if is_hnd:
+                        return (
+                            lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
+                            unwrapped,
+                        )
+                    return (
+                        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+                        unwrapped,
+                    )
                 # MLA / DSA tuples: every plane has a single latent KV head
                 # and the plane widths are mutually unequal (a DSA cache is
                 # always a 3-tuple). Equal-width pairs stay generic (K, V).

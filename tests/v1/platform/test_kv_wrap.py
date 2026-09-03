@@ -57,20 +57,19 @@ def test_planes_per_layer_reads_uniform_tuple_arity() -> None:
 def test_planes_per_layer_defaults_for_flat_or_mixed_values() -> None:
     assert kv_wrap.planes_per_layer({"l": torch.zeros(1)}) == 1
     assert kv_wrap.planes_per_layer({}) == 1
-    # Mixed tuple / tensor values carry no single arity; keep the default so
-    # the server-side detection surfaces the inconsistency loudly.
-    assert (
-        kv_wrap.planes_per_layer(
-            {"a": (torch.zeros(1), torch.zeros(1)), "b": torch.zeros(1)}
-        )
-        == 1
-    )
-    assert (
-        kv_wrap.planes_per_layer(
-            {"a": (torch.zeros(1),), "b": (torch.zeros(1), torch.zeros(1))}
-        )
-        == 1
-    )
+    assert kv_wrap.planes_per_layer(
+        {"a": (torch.zeros(1), torch.zeros(1)), "b": torch.zeros(1)}
+    ) == [2, 1]
+    assert kv_wrap.planes_per_layer(
+        {"a": (torch.zeros(1),), "b": (torch.zeros(1), torch.zeros(1))}
+    ) == [1, 2]
+
+
+def test_with_planes_per_layer_merges_mixed_arity_list() -> None:
+    hints = {"kv_layout": "NHD"}
+    merged = kv_wrap.with_planes_per_layer(hints, [1, 2, 1])
+    assert merged == {"kv_layout": "NHD", "planes_per_layer": [1, 2, 1]}
+    assert hints == {"kv_layout": "NHD"}
 
 
 def test_wrap_kv_caches_wraps_flattened_tuple_values(

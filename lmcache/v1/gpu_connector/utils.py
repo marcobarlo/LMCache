@@ -8,7 +8,7 @@
 # mypy: disable-error-code="union-attr,call-overload"
 # Standard
 from collections.abc import Hashable, Sequence
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 # Third Party
 import torch
@@ -278,7 +278,9 @@ def normalize_and_discover_per_layer_formats(
         layout_hints: See :class:`LayoutHints`. When the
             ``planes_per_layer`` hint is greater than 1 and ``kv_caches``
             is a flat list of paged plane tensors, consecutive planes are
-            regrouped into per-layer tuples before classification.
+            regrouped into per-layer tuples before classification. A
+            ``list[int]`` hint is a per-layer arity (mixed 1-/2-/3-plane
+            registrations); arity-1 slices unwrap to a bare tensor.
 
     Returns:
         ``(normalized_kv_caches, engine_kv_formats)``: the canonical KV cache
@@ -290,12 +292,35 @@ def normalize_and_discover_per_layer_formats(
             flat plane list length is not a multiple of it.
     """
     planes_per_layer = (layout_hints or {}).get("planes_per_layer", 1)
-    if planes_per_layer < 1:
-        raise ValueError(
-            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
-        )
-    if planes_per_layer > 1:
-        kv_caches = _regroup_planes_per_layer(kv_caches, planes_per_layer)
+    if isinstance(planes_per_layer, int):
+        if planes_per_layer < 1:
+            raise ValueError(
+                f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
+            )
+        if planes_per_layer > 1:
+            kv_caches = _regroup_planes_per_layer(kv_caches, planes_per_layer)
+    else:
+        if any(n < 1 for n in planes_per_layer):
+            raise ValueError(
+                f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
+            )
+        if not isinstance(kv_caches, list) or sum(planes_per_layer) != len(kv_caches):
+            n_planes = (
+                len(kv_caches)
+                if isinstance(kv_caches, list)
+                else type(kv_caches).__name__
+            )
+            raise ValueError(
+                f"planes_per_layer sum {sum(planes_per_layer)} != "
+                f"registered plane count ({n_planes})"
+            )
+        offset = 0
+        grouped: list[Any] = []
+        for n in planes_per_layer:
+            chunk = kv_caches[offset : offset + n]
+            offset += n
+            grouped.append(chunk[0] if n == 1 else tuple(chunk))
+        kv_caches = cast("DiscoverableKVCache", grouped)
 
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.
@@ -535,8 +560,13 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # Formats whose per-layer tensor dim-0 is the *block* axis AND for
 # which we currently support dim-0 padding (e.g. DeepSeek V4
 # compressor / indexer caches sharing a KV pool with larger attn
-# groups). Today only the MLA layout (``NL_X_NB_BS_HS``, kv_size==1)
-# is exercised by real mixed-compression workloads.
+# groups).
+#
+# ``NL_X_TWO_X_NB_BS_HS`` (vLLM-Ascend w8a8 MLA latent+scale tuples)
+# is included because measured DSv4 planes share one per-block *byte*
+# step (latent: 16640 int8 elems; scale: 8320 float16 elems). A
+# sibling-plane check in :func:`resolve_block_stride_and_log_layout`
+# rejects tuples whose dim-0 byte strides disagree.
 #
 # ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
 # axis on dim-0, but no real serving engine emits a padded layout of
@@ -553,6 +583,7 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
+        lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS,
         # Under vLLM's blocks-first layouts (BLHNC / BLNHC) these views'
         # stride(0) spans every layer's bytes for the block; when the cache
         # is layer-compact, stride(0) is simply the tight per-block step.
@@ -560,6 +591,37 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
         lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
 )
+
+
+def _dim0_byte_stride(tensor: torch.Tensor) -> int:
+    """Physical dim-0 step in bytes (stride(0) * element size)."""
+    return int(tensor.stride(0)) * int(tensor.element_size())
+
+
+def _assert_tuple_planes_share_block_byte_stride(
+    planes: object,
+    probe: torch.Tensor,
+    engine_kv_format: "lmcache_native.EngineKVFormat",
+) -> None:
+    """Reject multi-plane layers whose dim-0 byte strides disagree.
+
+    ``PageBufferShapeDesc.block_stride_elems`` is one int per kernel
+    group. Independently-strided planes cannot share it; fail closed.
+    """
+    if not isinstance(planes, (list, tuple)):
+        return
+    expected = _dim0_byte_stride(probe)
+    for i, plane in enumerate(planes):
+        if not isinstance(plane, torch.Tensor):
+            continue
+        got = _dim0_byte_stride(plane)
+        if got != expected:
+            raise ValueError(
+                "resolve_block_stride_and_log_layout: plane "
+                f"{i} dim-0 byte stride {got} != probe {expected} for "
+                f"{engine_kv_format!r}; a single block_stride_elems "
+                "cannot describe independently-strided planes."
+            )
 
 
 def resolve_block_stride_and_log_layout(
@@ -624,6 +686,12 @@ def resolve_block_stride_and_log_layout(
 
     block_stride_elems: Optional[int]
     if engine_kv_format in _BLOCK_AXIS_FORMATS and rep.ndim > 0:
+        if lmcache_native.is_kv_second_tuple(engine_kv_format):
+            _assert_tuple_planes_share_block_byte_stride(
+                kv_caches[layer_idx],  # type: ignore[index]
+                rep,
+                engine_kv_format,
+            )
         block_stride_elems = int(rep.stride(0))
     else:
         # Non-block-axis format: detect forbidden dim-0 padding.
