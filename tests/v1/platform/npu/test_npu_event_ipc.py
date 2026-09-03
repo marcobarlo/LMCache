@@ -113,3 +113,23 @@ def test_device_spec_exposes_cached_event_backend(
     first = spec.event_ipc_backend
     assert first.device_type == "npu"
     assert spec.event_ipc_backend is first
+
+
+def test_export_pins_source_events_in_bounded_cache() -> None:
+    """CANN invalidates a handle once its source event is destroyed."""
+    from lmcache.v1.platform.npu.event_ipc import (
+        _EXPORT_LIVENESS_CACHE,
+        NpuEventIPCBackend,
+    )
+
+    backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
+    events = [backend.create_event(_device()) for _ in range(3)]
+    for event in events:
+        backend.export_event(event, _device())
+
+    assert list(backend._exported_events) == events
+
+    for _ in range(_EXPORT_LIVENESS_CACHE):
+        backend.export_event(backend.create_event(_device()), _device())
+    assert len(backend._exported_events) == _EXPORT_LIVENESS_CACHE
+    assert events[0] not in backend._exported_events

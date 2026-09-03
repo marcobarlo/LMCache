@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 # Standard
+from collections import deque
 from typing import Any
 
 # First Party
@@ -12,6 +13,14 @@ from lmcache.logging import init_logger
 from lmcache.v1.platform.base.event_ipc import DefaultEventIPCBackend
 
 logger = init_logger(__name__)
+
+#: Exported event sources kept alive after export. CANN invalidates an
+#: exported interprocess handle once the source event object is destroyed,
+#: and the server's completion event goes out of scope the moment store()
+#: or retrieve() returns -- before the worker imports the handle. This
+#: bounded cache spans the message-queue transit window; once the importing
+#: process opens the handle it holds its own reference.
+_EXPORT_LIVENESS_CACHE = 1024
 
 
 def _torch_npu_module() -> Any:
@@ -53,9 +62,10 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
             ),
             device_type="npu",
         )
+        self._exported_events: deque = deque(maxlen=_EXPORT_LIVENESS_CACHE)
 
     def export_event(self, event: object, device: object) -> bytes:
-        """Serialize an event for another process, logging the handle bytes.
+        """Serialize an event for another process, keeping the source alive.
 
         Args:
             event: Backend-native event to export.
@@ -65,6 +75,7 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
             Serialized event handle.
         """
         handle = super().export_event(event, device)
+        self._exported_events.append(event)
         logger.info("NPU event export: device=%s %s", device, _handle_summary(handle))
         return handle
 
