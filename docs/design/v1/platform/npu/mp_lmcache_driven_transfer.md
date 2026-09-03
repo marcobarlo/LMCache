@@ -24,7 +24,7 @@ path; all other NPU-specific code lives in the plugin or under `npu/`:
   `multi_layer_block_kv_transfer` fallback
   (`_transfer_per_layer_mla_tuple`) let the torch fallback reconstruct NPU
   tensors from raw pointers and transfer per-layer plane tuples.
-- `LayoutHints.planes_per_layer` and the flat-list regroup in
+- `LayoutHints.planes_per_layer` (a per-layer count list) and the flat-list regroup in
   `normalize_and_discover_per_layer_formats` classify vLLM-Ascend's flat
   per-plane registration list as per-layer `(latent, rope[, dsa])` tuples
   before format detection.

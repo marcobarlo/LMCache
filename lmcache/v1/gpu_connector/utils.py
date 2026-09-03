@@ -214,46 +214,50 @@ def normalize_kv_and_discover_format(
 
 def _regroup_planes_per_layer(
     kv_caches: "DiscoverableKVCache",
-    planes_per_layer: int,
+    planes_per_layer: list[int],
 ) -> "DiscoverableKVCache":
     """Regroup a flat per-plane registration list into per-layer tuples.
 
     Engines with tuple KV layouts (vLLM-Ascend MLA/DSA) may register their
     paged planes as one flat tensor list (layer 0's planes, then layer 1's,
     ...). Detection classifies per-layer tuple structures, so consecutive
-    ``planes_per_layer`` tensors are bundled into one tuple per layer
-    before classification. Any other input shape (a single tensor,
-    already-grouped tuples, nested lists) is returned unchanged.
+    planes are bundled by the per-layer counts in ``planes_per_layer``.
+    Arity-1 slices unwrap to a bare tensor. Any other input shape (a
+    single tensor, already-grouped tuples, nested lists) is returned
+    unchanged.
 
     Args:
         kv_caches: The registered KV caches.
-        planes_per_layer: Planes per layer from the ``planes_per_layer``
-            layout hint; callers must pass a value greater than 1.
+        planes_per_layer: Per-layer plane counts from the layout hint.
 
     Returns:
-        The regrouped per-layer tuple list when ``kv_caches`` is a flat list
-        of tensors; ``kv_caches`` unchanged otherwise.
+        The regrouped per-layer list when ``kv_caches`` is a flat list of
+        tensors; ``kv_caches`` unchanged otherwise.
 
     Raises:
-        ValueError: If the flat list length is not a multiple of
-            ``planes_per_layer``.
+        ValueError: If a count is not positive, or the flat list length
+            does not match ``sum(planes_per_layer)``.
     """
-    if not isinstance(kv_caches, list):
-        return kv_caches
-    if not all(isinstance(entry, torch.Tensor) for entry in kv_caches):
-        return kv_caches
-    if len(kv_caches) % planes_per_layer != 0:
+    if any(n < 1 for n in planes_per_layer):
         raise ValueError(
-            f"planes_per_layer={planes_per_layer} does not divide the "
-            f"registered plane count ({len(kv_caches)}); a flat plane list "
-            "must contain a whole number of per-layer plane groups."
+            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
         )
-    flat_planes = cast("list[torch.Tensor]", kv_caches)
-    regrouped: list[tuple[torch.Tensor, ...]] = [
-        tuple(flat_planes[i : i + planes_per_layer])
-        for i in range(0, len(flat_planes), planes_per_layer)
-    ]
-    return cast("DiscoverableKVCache", regrouped)
+    if not isinstance(kv_caches, list) or not all(
+        isinstance(entry, torch.Tensor) for entry in kv_caches
+    ):
+        return kv_caches
+    if sum(planes_per_layer) != len(kv_caches):
+        raise ValueError(
+            f"planes_per_layer sum {sum(planes_per_layer)} != "
+            f"registered plane count ({len(kv_caches)})"
+        )
+    offset = 0
+    grouped: list[Any] = []
+    for n in planes_per_layer:
+        chunk = kv_caches[offset : offset + n]
+        offset += n
+        grouped.append(chunk[0] if n == 1 else tuple(chunk))
+    return cast("DiscoverableKVCache", grouped)
 
 
 def normalize_and_discover_per_layer_formats(
@@ -275,12 +279,10 @@ def normalize_and_discover_per_layer_formats(
         layer_index_groups: Layer indices of each engine group (one inner
             sequence per group). Empty means a single non-hybrid group.
         serving_engine: Which serving engine produced the caches.
-        layout_hints: See :class:`LayoutHints`. When the
-            ``planes_per_layer`` hint is greater than 1 and ``kv_caches``
-            is a flat list of paged plane tensors, consecutive planes are
-            regrouped into per-layer tuples before classification. A
-            ``list[int]`` hint is a per-layer arity (mixed 1-/2-/3-plane
-            registrations); arity-1 slices unwrap to a bare tensor.
+        layout_hints: See :class:`LayoutHints`. When ``planes_per_layer``
+            is a non-empty list and ``kv_caches`` is a flat list of paged
+            plane tensors, consecutive planes are regrouped into per-layer
+            tuples before classification (arity-1 slices unwrap).
 
     Returns:
         ``(normalized_kv_caches, engine_kv_formats)``: the canonical KV cache
@@ -288,39 +290,12 @@ def normalize_and_discover_per_layer_formats(
         ready for :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`.
 
     Raises:
-        ValueError: If the ``planes_per_layer`` hint is not positive, or a
-            flat plane list length is not a multiple of it.
+        ValueError: If a ``planes_per_layer`` count is not positive, or a
+            flat plane list length does not match the sum of counts.
     """
-    planes_per_layer = (layout_hints or {}).get("planes_per_layer", 1)
-    if isinstance(planes_per_layer, int):
-        if planes_per_layer < 1:
-            raise ValueError(
-                f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
-            )
-        if planes_per_layer > 1:
-            kv_caches = _regroup_planes_per_layer(kv_caches, planes_per_layer)
-    else:
-        if any(n < 1 for n in planes_per_layer):
-            raise ValueError(
-                f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
-            )
-        if not isinstance(kv_caches, list) or sum(planes_per_layer) != len(kv_caches):
-            n_planes = (
-                len(kv_caches)
-                if isinstance(kv_caches, list)
-                else type(kv_caches).__name__
-            )
-            raise ValueError(
-                f"planes_per_layer sum {sum(planes_per_layer)} != "
-                f"registered plane count ({n_planes})"
-            )
-        offset = 0
-        grouped: list[Any] = []
-        for n in planes_per_layer:
-            chunk = kv_caches[offset : offset + n]
-            offset += n
-            grouped.append(chunk[0] if n == 1 else tuple(chunk))
-        kv_caches = cast("DiscoverableKVCache", grouped)
+    planes_per_layer = (layout_hints or {}).get("planes_per_layer") or []
+    if planes_per_layer:
+        kv_caches = _regroup_planes_per_layer(kv_caches, list(planes_per_layer))
 
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.

@@ -59,63 +59,47 @@ def flatten_kv_cache_values(
 
 def planes_per_layer(
     kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> int | list[int]:
-    """Return the per-layer plane arity of ``kv_caches``.
+) -> list[int]:
+    """Return the per-layer plane counts of ``kv_caches``.
 
     Args:
         kv_caches: Mapping from layer name to tensor or per-layer tuple.
 
     Returns:
-        A single ``int`` when every layer has the same arity (``1`` for
-        bare tensors / arity-1 lists, ``N`` for uniform N-plane tuples).
-        A ``list[int]`` when arities mix (e.g. 1-plane SWA + 2-plane MLA),
-        one count per dict key in registration order.
+        One count per dict key in registration order (``1`` for a bare
+        tensor, ``len(tuple)`` for a plane tuple). Empty input yields
+        ``[]``.
     """
-    if not kv_caches:
-        return 1
     counts: list[int] = []
     for value in kv_caches.values():
-        if isinstance(value, torch.Tensor):
-            counts.append(1)
-        else:
-            counts.append(len(value))
-    unique = set(counts)
-    if unique == {1}:
-        return 1
-    if len(unique) == 1:
-        return unique.pop()
+        counts.append(1 if isinstance(value, torch.Tensor) else len(value))
     return counts
 
 
-def with_planes_per_layer(hints: Any, planes: int | list[int]) -> Any:
-    """Merge a derived plane arity into layout hints.
+def with_planes_per_layer(hints: Any, planes: list[int]) -> Any:
+    """Merge a derived per-layer plane-count list into layout hints.
 
     Hints are a plain dict / ``LayoutHints`` TypedDict at runtime; engines
     may pass partial dicts, so the merge keeps every existing key.
 
     Args:
         hints: The existing layout hints (dict / LayoutHints).
-        planes: The derived per-layer plane arity (uniform ``int`` or a
-            mixed-arity ``list[int]``).
+        planes: Per-layer plane counts in registration order.
 
     Returns:
-        A new dict carrying ``planes_per_layer`` when the arity is not the
-        default ``1`` and the hints do not already set it; the input
-        otherwise (including for any non-dict hints object, which is
-        passed through untouched).
+        A new dict carrying ``planes_per_layer`` when any count is not 1
+        and the hints do not already set it; the input otherwise
+        (including for any non-dict hints object).
     """
     if not isinstance(hints, dict):
         return hints
-    if isinstance(planes, int):
-        if planes <= 1:
-            return hints
-    elif all(n == 1 for n in planes):
+    if not planes or all(n == 1 for n in planes):
         return hints
-    if hints.get("planes_per_layer", 1) == 1:
-        merged = dict(hints)
-        merged["planes_per_layer"] = planes
-        return merged
-    return hints
+    if hints.get("planes_per_layer"):
+        return hints
+    merged = dict(hints)
+    merged["planes_per_layer"] = planes
+    return merged
 
 
 def wrap_kv_caches(

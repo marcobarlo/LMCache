@@ -622,7 +622,7 @@ def test_regroup_two_planes_detects_mla_tuple() -> None:
         flat,
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": 2},
+        {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
     )
     assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
     assert len(normalized) == NL
@@ -643,7 +643,7 @@ def test_regroup_three_planes_detects_dsa_tuple() -> None:
         _flat_planes((HS * 8, HS, HS * 2)),
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": 3},
+        {"kv_layout": "NHD", "planes_per_layer": [3] * NL},
     )
     assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
     assert len(normalized) == NL
@@ -669,7 +669,7 @@ def test_regroup_skips_already_grouped_tuples() -> None:
         tuples,
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": 2},
+        {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
     )
     assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
     assert len(normalized) == NL
@@ -683,7 +683,7 @@ def test_regroup_rejects_indivisible_plane_count() -> None:
             flat,
             [],
             EngineType.VLLM,
-            {"kv_layout": "NHD", "planes_per_layer": 2},
+            {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
         )
 
 
