@@ -8,7 +8,7 @@
 # mypy: disable-error-code="union-attr,call-overload"
 # Standard
 from collections.abc import Hashable, Sequence
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 # Third Party
 import torch
@@ -214,46 +214,58 @@ def normalize_kv_and_discover_format(
 
 def _regroup_planes_per_layer(
     kv_caches: "DiscoverableKVCache",
-    planes_per_layer: int,
+    planes_per_layer: list[int],
 ) -> "DiscoverableKVCache":
     """Regroup a flat per-plane registration list into per-layer tuples.
 
     Engines with tuple KV layouts (vLLM-Ascend MLA/DSA) may register their
     paged planes as one flat tensor list (layer 0's planes, then layer 1's,
     ...). Detection classifies per-layer tuple structures, so consecutive
-    ``planes_per_layer`` tensors are bundled into one tuple per layer
-    before classification. Any other input shape (a single tensor,
-    already-grouped tuples, nested lists) is returned unchanged.
+    planes are bundled by the per-layer counts in ``planes_per_layer``.
+    Arity-1 slices unwrap to a bare tensor. Any other input shape (a
+    single tensor, already-grouped tuples, nested lists) is returned
+    unchanged.
 
     Args:
         kv_caches: The registered KV caches.
-        planes_per_layer: Planes per layer from the ``planes_per_layer``
-            layout hint; callers must pass a value greater than 1.
+        planes_per_layer: Per-layer plane counts from the layout hint.
 
     Returns:
-        The regrouped per-layer tuple list when ``kv_caches`` is a flat list
-        of tensors; ``kv_caches`` unchanged otherwise.
+        The regrouped per-layer list when ``kv_caches`` is a flat list of
+        tensors; ``kv_caches`` unchanged otherwise.
 
     Raises:
-        ValueError: If the flat list length is not a multiple of
-            ``planes_per_layer``.
+        ValueError: If a count is not positive, or the flat list length
+            does not match ``sum(planes_per_layer)``.
     """
-    if not isinstance(kv_caches, list):
-        return kv_caches
-    if not all(isinstance(entry, torch.Tensor) for entry in kv_caches):
-        return kv_caches
-    if len(kv_caches) % planes_per_layer != 0:
+    if any(n < 1 for n in planes_per_layer):
         raise ValueError(
-            f"planes_per_layer={planes_per_layer} does not divide the "
-            f"registered plane count ({len(kv_caches)}); a flat plane list "
-            "must contain a whole number of per-layer plane groups."
+            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
         )
-    flat_planes = cast("list[torch.Tensor]", kv_caches)
-    regrouped: list[tuple[torch.Tensor, ...]] = [
-        tuple(flat_planes[i : i + planes_per_layer])
-        for i in range(0, len(flat_planes), planes_per_layer)
-    ]
-    return cast("DiscoverableKVCache", regrouped)
+    if not isinstance(kv_caches, list) or not all(
+        isinstance(entry, torch.Tensor) for entry in kv_caches
+    ):
+        return kv_caches
+    if sum(planes_per_layer) != len(kv_caches):
+        raise ValueError(
+            f"planes_per_layer sum {sum(planes_per_layer)} != "
+            f"registered plane count ({len(kv_caches)})"
+        )
+    offset = 0
+    grouped: list[Any] = []
+    for n in planes_per_layer:
+        chunk = kv_caches[offset : offset + n]
+        offset += n
+        grouped.append(chunk[0] if n == 1 else tuple(chunk))
+    return cast("DiscoverableKVCache", grouped)
+
+
+def _layer_structure_key(entry: object) -> Hashable:
+    """Hashable key that distinguishes tuples/lists from plain tensors."""
+    if isinstance(entry, (list, tuple)):
+        return tuple(_layer_structure_key(item) for item in entry)
+    shape = getattr(entry, "shape", None)
+    return tuple(shape) if shape is not None else None
 
 
 def normalize_and_discover_per_layer_formats(
@@ -275,10 +287,10 @@ def normalize_and_discover_per_layer_formats(
         layer_index_groups: Layer indices of each engine group (one inner
             sequence per group). Empty means a single non-hybrid group.
         serving_engine: Which serving engine produced the caches.
-        layout_hints: See :class:`LayoutHints`. When the
-            ``planes_per_layer`` hint is greater than 1 and ``kv_caches``
-            is a flat list of paged plane tensors, consecutive planes are
-            regrouped into per-layer tuples before classification.
+        layout_hints: See :class:`LayoutHints`. When ``planes_per_layer``
+            is a non-empty list and ``kv_caches`` is a flat list of paged
+            plane tensors, consecutive planes are regrouped into per-layer
+            tuples before classification (arity-1 slices unwrap).
 
     Returns:
         ``(normalized_kv_caches, engine_kv_formats)``: the canonical KV cache
@@ -286,16 +298,12 @@ def normalize_and_discover_per_layer_formats(
         ready for :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`.
 
     Raises:
-        ValueError: If the ``planes_per_layer`` hint is not positive, or a
-            flat plane list length is not a multiple of it.
+        ValueError: If a ``planes_per_layer`` count is not positive, or a
+            flat plane list length does not match the sum of counts.
     """
-    planes_per_layer = (layout_hints or {}).get("planes_per_layer", 1)
-    if planes_per_layer < 1:
-        raise ValueError(
-            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
-        )
-    if planes_per_layer > 1:
-        kv_caches = _regroup_planes_per_layer(kv_caches, planes_per_layer)
+    planes_per_layer = (layout_hints or {}).get("planes_per_layer") or []
+    if planes_per_layer:
+        kv_caches = _regroup_planes_per_layer(kv_caches, list(planes_per_layer))
 
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.
@@ -318,8 +326,7 @@ def normalize_and_discover_per_layer_formats(
     for indices in groups:
         layers_by_shape: dict[Hashable, list[int]] = {}
         for i in indices:
-            shape = getattr(kv_caches[i], "shape", None)
-            key = tuple(shape) if shape is not None else None
+            key = _layer_structure_key(kv_caches[i])
             layers_by_shape.setdefault(key, []).append(i)
         for same_shape_indices in layers_by_shape.values():
             fmt, normalized = detect_format(
@@ -535,8 +542,13 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # Formats whose per-layer tensor dim-0 is the *block* axis AND for
 # which we currently support dim-0 padding (e.g. DeepSeek V4
 # compressor / indexer caches sharing a KV pool with larger attn
-# groups). Today only the MLA layout (``NL_X_NB_BS_HS``, kv_size==1)
-# is exercised by real mixed-compression workloads.
+# groups).
+#
+# ``NL_X_TWO_X_NB_BS_HS`` (vLLM-Ascend w8a8 MLA latent+scale tuples)
+# is included because measured DSv4 planes share one per-block *byte*
+# step (latent: 16640 int8 elems; scale: 8320 float16 elems). A
+# sibling-plane check in :func:`resolve_block_stride_and_log_layout`
+# rejects tuples whose dim-0 byte strides disagree.
 #
 # ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
 # axis on dim-0, but no real serving engine emits a padded layout of
@@ -553,6 +565,7 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
+        lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS,
         # Under vLLM's blocks-first layouts (BLHNC / BLNHC) these views'
         # stride(0) spans every layer's bytes for the block; when the cache
         # is layer-compact, stride(0) is simply the tight per-block step.
@@ -560,6 +573,37 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
         lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
 )
+
+
+def _dim0_byte_stride(tensor: torch.Tensor) -> int:
+    """Physical dim-0 step in bytes (stride(0) * element size)."""
+    return int(tensor.stride(0)) * int(tensor.element_size())
+
+
+def _assert_tuple_planes_share_block_byte_stride(
+    planes: object,
+    probe: torch.Tensor,
+    engine_kv_format: "lmcache_native.EngineKVFormat",
+) -> None:
+    """Reject multi-plane layers whose dim-0 byte strides disagree.
+
+    ``PageBufferShapeDesc.block_stride_elems`` is one int per kernel
+    group. Independently-strided planes cannot share it; fail closed.
+    """
+    if not isinstance(planes, (list, tuple)):
+        return
+    expected = _dim0_byte_stride(probe)
+    for i, plane in enumerate(planes):
+        if not isinstance(plane, torch.Tensor):
+            continue
+        got = _dim0_byte_stride(plane)
+        if got != expected:
+            raise ValueError(
+                "resolve_block_stride_and_log_layout: plane "
+                f"{i} dim-0 byte stride {got} != probe {expected} for "
+                f"{engine_kv_format!r}; a single block_stride_elems "
+                "cannot describe independently-strided planes."
+            )
 
 
 def resolve_block_stride_and_log_layout(
@@ -624,6 +668,12 @@ def resolve_block_stride_and_log_layout(
 
     block_stride_elems: Optional[int]
     if engine_kv_format in _BLOCK_AXIS_FORMATS and rep.ndim > 0:
+        if lmcache_native.is_kv_second_tuple(engine_kv_format):
+            _assert_tuple_planes_share_block_byte_stride(
+                kv_caches[layer_idx],  # type: ignore[index]
+                rep,
+                engine_kv_format,
+            )
         block_stride_elems = int(rep.stride(0))
     else:
         # Non-block-axis format: detect forbidden dim-0 padding.
