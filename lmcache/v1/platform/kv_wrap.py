@@ -35,31 +35,83 @@ def wrap_one_kv_cache(tensor: torch.Tensor) -> Any:
     return resolve_kv_wrapper_factory(tensor.device.type)(tensor)
 
 
-def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
+def flatten_kv_cache_values(
+    kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
+) -> list[torch.Tensor]:
+    """Flatten per-layer tensor-or-tuple values into one ordered list.
+
+    Args:
+        kv_caches: Mapping from layer name to the layer's KV tensor or, for
+            engines that hand per-layer plane tuples (e.g. vLLM-Ascend's
+            per-layer (K, V) pairs), the tuple of that layer's planes.
+
+    Returns:
+        Every tensor in layer-then-plane order.
+    """
+    flat: list[torch.Tensor] = []
+    for value in kv_caches.values():
+        if isinstance(value, (tuple, list)):
+            flat.extend(value)
+        else:
+            flat.append(value)
+    return flat
+
+
+def planes_per_layer(
+    kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
+) -> int:
+    """Return the uniform per-layer plane arity of ``kv_caches``.
+
+    Args:
+        kv_caches: Mapping from layer name to tensor or per-layer tuple.
+
+    Returns:
+        The tuple arity when every layer value is a tuple of the same
+        arity greater than one; otherwise ``1``. Mixed or arity-1 layouts
+        return ``1`` so the server-side detection surfaces the structure
+        it actually receives instead of guessing.
+    """
+    if not kv_caches:
+        return 1
+    values = list(kv_caches.values())
+    if not all(isinstance(value, (tuple, list)) for value in values):
+        return 1
+    arities = {len(value) for value in values}
+    if len(arities) != 1:
+        return 1
+    arity = arities.pop()
+    return arity if arity > 1 else 1
+
+
+def wrap_kv_caches(
+    kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
+) -> KVCache:
     """Wrap every KV cache tensor for IPC transport.
 
     Args:
-        kv_caches: Mapping from layer name to worker-owned KV cache tensor.
+        kv_caches: Mapping from layer name to the layer's KV tensor or
+            per-layer plane tuple (e.g. vLLM-Ascend's (K, V) pairs); tuple
+            values are flattened in layer-then-plane order, so pair this
+            with ``LayoutHints.planes_per_layer`` so the server regroups
+            the flat wrapper list back into layers.
 
     Returns:
         The list of per-tensor IPC wrappers, ready for the msgspec wire.
     """
-    # Emit a per-layer (name, shape, dtype) summary so the operator can
-    # verify the exact layer set & tensor geometry being shipped to the
-    # LMCache server, then the low-noise count of handles being wrapped.
-    kept_summary = [
-        (name, tuple(tensor.shape), str(tensor.dtype))
-        for name, tensor in kv_caches.items()
-    ]
+    flat = flatten_kv_cache_values(kv_caches)
+    # Emit a per-tensor (shape, dtype) summary so the operator can verify
+    # the exact tensor geometry being shipped to the LMCache server, then
+    # the low-noise count of handles being wrapped.
+    kept_summary = [(tuple(tensor.shape), str(tensor.dtype)) for tensor in flat]
     logger.debug(
-        "KV cache transfer keeping %d layer(s) (name, shape, dtype):\n%s",
+        "KV cache transfer keeping %d tensor(s) (shape, dtype):\n%s",
         len(kept_summary),
         "\n".join(
-            f"  [{i}] {name}  shape={shape}  dtype={dtype}"
-            for i, (name, shape, dtype) in enumerate(kept_summary)
+            f"  [{i}]  shape={shape}  dtype={dtype}"
+            for i, (shape, dtype) in enumerate(kept_summary)
         ),
     )
-    logger.info("Wrapping %d KV cache tensors for IPC", len(kv_caches))
+    logger.info("Wrapping %d KV cache tensors for IPC", len(flat))
     # Per-iteration resource management: if wrapping the N-th tensor
     # raises, ``shm_unlink`` whatever earlier iterations already
     # registered with POSIX SHM so the named segments do not outlive
@@ -67,7 +119,7 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
     # are skipped via the duck-typed ``shm_name`` check.
     wrappers: KVCache = []
     try:
-        for tensor in kv_caches.values():
+        for tensor in flat:
             wrappers.append(wrap_one_kv_cache(tensor))
     except BaseException:
         _release_partial_kv_wrappers(wrappers)
