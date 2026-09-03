@@ -104,3 +104,40 @@ def test_temp_buffer_allocates_on_device() -> None:
     view.fill_(1.0)
     flat = buffer.get_temp_object_group_buffer(0, 0)
     assert flat.view(torch.float32).sum().item() == float(view.numel())
+
+
+@requires_npu
+def test_pointer_mode_memcpy_roundtrip_on_device() -> None:
+    """lmcache_memcpy_async pointer mode copies via tensor views, not CUDA."""
+    # Third Party
+    import lmcache.lmcache_native as lmcache_native
+
+    from lmcache.v1.platform.npu.device_ops import NpuDeviceOps
+
+    ops = NpuDeviceOps()
+    device = torch.device("npu:0")
+    # int32: aclnnArange does not implement uint8 on this CANN build.
+    src = torch.arange(64, dtype=torch.int32, device=device)
+    host = torch.zeros(64, dtype=torch.int32, pin_memory=True)
+    ops.lmcache_memcpy_async(
+        host.data_ptr(),
+        src.data_ptr(),
+        256,
+        lmcache_native.TransferDirection.D2H,
+        0,
+        1,
+    )
+    torch.npu.current_stream().synchronize()
+    assert torch.equal(host, src.cpu())
+
+    mutated = torch.full((64,), 7, dtype=torch.int32)
+    ops.lmcache_memcpy_async(
+        src.data_ptr(),
+        mutated.data_ptr(),
+        256,
+        lmcache_native.TransferDirection.H2D,
+        0,
+        1,
+    )
+    torch.npu.current_stream().synchronize()
+    assert torch.equal(src.cpu(), mutated)

@@ -13,12 +13,17 @@ torch fallback (soft-fail, same as CUDA).
 from __future__ import annotations
 
 # Standard
+import ctypes
 from typing import ClassVar
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.platform import torch_ops
 from lmcache.v1.platform.base.device_ops import DeviceOps
+import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
 
@@ -79,7 +84,11 @@ class NpuDeviceOps(DeviceOps):
         # module lacks; instance-binding those would shadow the class-level
         # stream-ordered overrides below (the storage ownership contract).
         # Drop re-exports only: a genuine native implementation stays bound.
-        for name in ("record_completion_on_stream", "record_event_on_stream"):
+        for name in (
+            "record_completion_on_stream",
+            "record_event_on_stream",
+            "lmcache_memcpy_async",
+        ):
             bound = self.__dict__.get(name)
             if bound is not None and bound is getattr(torch_ops, name, None):
                 del self.__dict__[name]
@@ -138,3 +147,51 @@ class NpuDeviceOps(DeviceOps):
             str_metadata,
             int_metadata,
         )
+
+    def lmcache_memcpy_async(
+        self,
+        dest: int,
+        src: int,
+        nbytes: int,
+        direction: lmcache_native.TransferDirection,
+        host_buffer_offset: int,
+        host_buffer_alignments: int,
+    ) -> None:
+        """Copy ``nbytes`` between an NPU device pointer and host memory.
+
+        The torch baseline's pointer mode drives ``cudaMemcpy`` through
+        libcudart, which cannot address NPU memory and crashes the process.
+        Instead build zero-copy views over both pointers and issue one
+        stream-ordered ``copy_`` on the current stream. The CUDA-specific
+        ``host_buffer_offset`` / ``host_buffer_alignments`` chunking
+        parameters are ignored: a single ``copy_`` needs no boundary
+        splitting.
+
+        Args:
+            dest: Destination address. Host for D2H, device for H2D.
+            src: Source address. Device for D2H, host for H2D.
+            nbytes: Number of bytes to copy.
+            direction: H2D or D2H; selects which side is host memory.
+            host_buffer_offset: Unused (CUDA chunking parameter).
+            host_buffer_alignments: Unused (CUDA chunking parameter).
+
+        Raises:
+            ValueError: If ``nbytes`` is not positive or the direction is
+                unsupported.
+        """
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be positive, got {nbytes}")
+        is_d2h = int(direction) == int(lmcache_native.TransferDirection.D2H)
+        is_h2d = int(direction) == int(lmcache_native.TransferDirection.H2D)
+        if not (is_d2h or is_h2d):
+            raise ValueError(f"Unsupported transfer direction: {direction!r}")
+        host_ptr, dev_ptr = (dest, src) if is_d2h else (src, dest)
+        device = torch.device(f"npu:{torch.npu.current_device()}")
+        dev_view = torch_ops._tensor_from_ptr(dev_ptr, (nbytes,), torch.uint8, device)
+        host_view = torch.frombuffer(
+            (ctypes.c_uint8 * nbytes).from_address(host_ptr), dtype=torch.uint8
+        )
+        if is_d2h:
+            host_view.copy_(dev_view, non_blocking=True)
+        else:
+            dev_view.copy_(host_view, non_blocking=True)

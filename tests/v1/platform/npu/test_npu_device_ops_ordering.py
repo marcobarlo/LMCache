@@ -133,3 +133,28 @@ def test_genuine_native_recorder_binding_is_kept(
     ops.ensure_native()
     assert ops.__dict__["record_completion_on_stream"] is _native_recorder
     assert ops.__dict__["record_event_on_stream"] is _native_event_recorder
+
+
+def test_c_ops_torch_reexport_of_memcpy_is_dropped_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The merged torch-fallback lmcache_memcpy_async must not shadow the
+    NPU pointer-mode override (libcudart cannot copy NPU memory)."""
+    # Standard
+    import sys
+    import types
+
+    fake_c_ops = types.ModuleType("lmcache_ascend.c_ops")
+    setattr(
+        fake_c_ops,
+        "lmcache_memcpy_async",
+        torch_ops.lmcache_memcpy_async,
+    )
+    fake_pkg = types.ModuleType("lmcache_ascend")
+    setattr(fake_pkg, "c_ops", fake_c_ops)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend", fake_pkg)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake_c_ops)
+
+    ops = NpuDeviceOps()
+    ops.ensure_native()
+    assert "lmcache_memcpy_async" not in vars(ops)
