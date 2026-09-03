@@ -8,7 +8,10 @@ from __future__ import annotations
 from typing import Any
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.platform.base.event_ipc import DefaultEventIPCBackend
+
+logger = init_logger(__name__)
 
 
 def _torch_npu_module() -> Any:
@@ -22,6 +25,11 @@ def _torch_npu_module() -> Any:
             "torch_npu is not installed; NPU interprocess events are unavailable."
         )
     return npu
+
+
+def _handle_summary(handle: bytes) -> str:
+    """Return a stable diagnostic summary of an event handle."""
+    return f"len={len(handle)} head={handle[:16].hex()}"
 
 
 class NpuEventIPCBackend(DefaultEventIPCBackend):
@@ -45,3 +53,42 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
             ),
             device_type="npu",
         )
+
+    def export_event(self, event: object, device: object) -> bytes:
+        """Serialize an event for another process, logging the handle bytes.
+
+        Args:
+            event: Backend-native event to export.
+            device: Device that owns the event.
+
+        Returns:
+            Serialized event handle.
+        """
+        handle = super().export_event(event, device)
+        logger.info("NPU event export: device=%s %s", device, _handle_summary(handle))
+        return handle
+
+    def import_event(self, handle: bytes, device: object) -> object:
+        """Import a serialized event handle, diagnosing failures.
+
+        Args:
+            handle: Serialized event handle from another process.
+            device: Device on which to import.
+
+        Returns:
+            The imported backend-native event.
+
+        Raises:
+            RuntimeError: When the underlying import fails, enriched with
+                the handle summary and target device for triage.
+        """
+        try:
+            return super().import_event(handle, device)
+        except Exception as exc:
+            logger.warning(
+                "NPU event import failed: device=%s %s error=%s",
+                device,
+                _handle_summary(handle),
+                exc,
+            )
+            raise
