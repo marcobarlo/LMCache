@@ -76,7 +76,6 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
         """
         handle = super().export_event(event, device)
         self._exported_events.append(event)
-        logger.info("NPU event export: device=%s %s", device, _handle_summary(handle))
         return handle
 
     def import_event(self, handle: bytes, device: object) -> object:
