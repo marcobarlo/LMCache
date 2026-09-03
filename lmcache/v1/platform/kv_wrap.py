@@ -83,6 +83,30 @@ def planes_per_layer(
     return arity if arity > 1 else 1
 
 
+def with_planes_per_layer(hints: Any, planes: int) -> Any:
+    """Merge a derived plane arity into layout hints.
+
+    Hints are a plain dict / ``LayoutHints`` TypedDict at runtime; engines
+    may pass partial dicts, so the merge keeps every existing key.
+
+    Args:
+        hints: The existing layout hints (dict / LayoutHints).
+        planes: The derived per-layer plane arity.
+
+    Returns:
+        A new dict carrying ``planes_per_layer`` when ``planes > 1`` and the
+        hints do not already set it; the input otherwise (including for any
+        non-dict hints object, which is passed through untouched).
+    """
+    if planes <= 1 or not isinstance(hints, dict):
+        return hints
+    if hints.get("planes_per_layer", 1) == 1:
+        merged = dict(hints)
+        merged["planes_per_layer"] = planes
+        return merged
+    return hints
+
+
 def wrap_kv_caches(
     kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
 ) -> KVCache:
