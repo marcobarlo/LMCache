@@ -12,6 +12,7 @@ them without importing the vLLM integration package.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Sequence
 from typing import Any
 
 # Third Party
@@ -59,52 +60,72 @@ def flatten_kv_cache_values(
 
 def planes_per_layer(
     kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> int:
-    """Return the uniform per-layer plane arity of ``kv_caches``.
+) -> list[int]:
+    """Return the per-layer plane counts of ``kv_caches``.
 
     Args:
         kv_caches: Mapping from layer name to tensor or per-layer tuple.
 
     Returns:
-        The tuple arity when every layer value is a tuple of the same
-        arity greater than one; otherwise ``1``. Mixed or arity-1 layouts
-        return ``1`` so the server-side detection surfaces the structure
-        it actually receives instead of guessing.
+        One count per dict key in registration order (``1`` for a bare
+        tensor, ``len(tuple)`` for a plane tuple). Empty input yields
+        ``[]``.
     """
-    if not kv_caches:
-        return 1
-    values = list(kv_caches.values())
-    if not all(isinstance(value, (tuple, list)) for value in values):
-        return 1
-    arities = {len(value) for value in values}
-    if len(arities) != 1:
-        return 1
-    arity = arities.pop()
-    return arity if arity > 1 else 1
+    counts: list[int] = []
+    for value in kv_caches.values():
+        counts.append(1 if isinstance(value, torch.Tensor) else len(value))
+    return counts
 
 
-def with_planes_per_layer(hints: Any, planes: int) -> Any:
-    """Merge a derived plane arity into layout hints.
+def per_layer_planes(
+    kv_caches: dict[str, "torch.Tensor | Sequence[torch.Tensor]"],
+) -> list["torch.Tensor | tuple[torch.Tensor, ...]"]:
+    """Canonicalize each layer to a bare tensor or a plane tuple.
+
+    Args:
+        kv_caches: Mapping from layer name to tensor or a per-layer
+            sequence of tensors.
+
+    Returns:
+        One entry per layer in registration order. Arity-1 sequences
+        unwrap to their only tensor; larger sequences become tuples.
+    """
+    canonical: list["torch.Tensor | tuple[torch.Tensor, ...]"] = []
+    for value in kv_caches.values():
+        if isinstance(value, torch.Tensor):
+            canonical.append(value)
+            continue
+        if len(value) == 1:
+            canonical.append(value[0])
+            continue
+        canonical.append(tuple(value))
+    return canonical
+
+
+def with_planes_per_layer(hints: Any, planes: list[int]) -> Any:
+    """Merge a derived per-layer plane-count list into layout hints.
 
     Hints are a plain dict / ``LayoutHints`` TypedDict at runtime; engines
     may pass partial dicts, so the merge keeps every existing key.
 
     Args:
         hints: The existing layout hints (dict / LayoutHints).
-        planes: The derived per-layer plane arity.
+        planes: Per-layer plane counts in registration order.
 
     Returns:
-        A new dict carrying ``planes_per_layer`` when ``planes > 1`` and the
-        hints do not already set it; the input otherwise (including for any
-        non-dict hints object, which is passed through untouched).
+        A new dict carrying ``planes_per_layer`` when any count is not 1
+        and the hints do not already set it; the input otherwise
+        (including for any non-dict hints object).
     """
-    if planes <= 1 or not isinstance(hints, dict):
+    if not isinstance(hints, dict):
         return hints
-    if hints.get("planes_per_layer", 1) == 1:
-        merged = dict(hints)
-        merged["planes_per_layer"] = planes
-        return merged
-    return hints
+    if not planes or all(n == 1 for n in planes):
+        return hints
+    if hints.get("planes_per_layer"):
+        return hints
+    merged = dict(hints)
+    merged["planes_per_layer"] = planes
+    return merged
 
 
 def wrap_kv_caches(

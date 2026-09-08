@@ -60,8 +60,18 @@ class NL_X_TWO_X_NB_BS_HS_Spec(KVFormatSpec):
         return 1
 
     def hidden_dim(self, layer_idx: int = 0) -> int:
-        widths = (int(t.shape[-1]) for t in self.kv_caches[layer_idx])
-        return sum(widths, 0)
+        # Count object columns in ``dtype`` elements so mixed-item-size
+        # planes (w8a8 latent int8 + scale float16) pack losslessly.
+        # Homogeneous dtypes reduce to ``sum(widths)``.
+        planes = self.kv_caches[layer_idx]
+        total_bytes = sum(int(t.shape[-1]) * int(t.element_size()) for t in planes)
+        itemsize = int(self.dtype(layer_idx).itemsize)
+        if itemsize <= 0 or total_bytes % itemsize != 0:
+            raise ValueError(
+                "NL_X_TWO_X_NB_BS_HS hidden_dim: plane byte total "
+                f"{total_bytes} is not a multiple of dtype itemsize {itemsize}"
+            )
+        return total_bytes // itemsize
 
     def head_size(self, layer_idx: int = 0) -> int:
         return self.hidden_dim(layer_idx)

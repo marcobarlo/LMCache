@@ -274,6 +274,7 @@ def create_engine_group_infos_from_vllm(
     from lmcache.v1.gpu_connector.utils import (
         normalize_and_discover_per_layer_formats,
     )
+    from lmcache.v1.platform.kv_wrap import per_layer_planes
     from lmcache.v1.kv_layer_groups import (
         EXCLUDED_ENGINE_GROUP,
         group_layers_by_identity,
@@ -285,7 +286,7 @@ def create_engine_group_infos_from_vllm(
     # have disjoint block-id spaces and must not share an LMCache group. ``None``
     # means a single (non-hybrid) group, i.e. every layer shares one block-id
     # space.
-    per_layer_discoverable_kv_caches = list(kv_caches.values())
+    per_layer_discoverable_kv_caches = per_layer_planes(dict(kv_caches))
     layer_to_idx = {name: idx for idx, name in enumerate(kv_caches.keys())}
     vllm_groups = (
         getattr(kv_cache_config, "kv_cache_groups", ()) or ()
