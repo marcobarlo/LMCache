@@ -52,15 +52,13 @@ class LayoutHints(TypedDict, total=False):
             daemon-side un-flattening and 3-D to 4-D reshaping even when
             tensor parallelism leaves one KV head per rank.
         head_dim: Per-head dimension. Used by TRT-LLM (same).
-        planes_per_layer: Number of paged plane tensors registered per layer
-            for tuple KV layouts (vLLM-Ascend MLA: 2 ``latent, rope``;
-            DSA: 3 ``latent, rope, dsa``). Values greater than 1 make
-            ``normalize_and_discover_per_layer_formats`` regroup a flat
-            per-plane registration list into per-layer tuples before format
-            classification -- only that per-layer API regroups; the
-            single-format facade ``normalize_kv_and_discover_format`` does
-            not. The default (1) leaves every existing registration
-            unchanged.
+        planes_per_layer: Per-layer plane counts for a flat registration
+            list (vLLM-Ascend MLA: ``2, 2, ...``; mixed SWA+MLA: ``1, 2, 1,
+            ...``). ``normalize_and_discover_per_layer_formats`` bundles
+            consecutive tensors into per-layer tuples; arity-1 slices
+            unwrap to a bare tensor. Omitted or empty leaves the input
+            unchanged. Only that per-layer API regroups; the single-format
+            facade ``normalize_kv_and_discover_format`` does not.
     """
 
     kv_layout: KVLayoutName
@@ -68,4 +66,4 @@ class LayoutHints(TypedDict, total=False):
     tokens_per_block: int
     kv_list_layout: Literal["k_v"]
     head_dim: int
-    planes_per_layer: int
+    planes_per_layer: list[int]

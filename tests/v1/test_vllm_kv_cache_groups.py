@@ -89,6 +89,13 @@ def _mla_caches(names: list[str]) -> dict[str, torch.Tensor]:
     return {n: torch.randn(32, 16, 128, dtype=torch.bfloat16) for n in names}
 
 
+def _single_plane(name: str, width: int = 512) -> tuple[str, list[torch.Tensor]]:
+    return (
+        name,
+        [torch.randn(32, 16, 1, width, dtype=torch.bfloat16)],
+    )
+
+
 def test_conversion_defaults_to_single_group_without_config():
     """No vLLM KV cache groups -> all layers fall into a single engine group."""
     spec = create_engine_group_infos_from_vllm(
@@ -342,6 +349,31 @@ def test_conversion_uniform_group_mixes_kv_and_mla_layouts():
     assert [group.layer_indices for group in spec] == [(0, 1), (2, 3)]
     # Both LMCache groups share the unified block-id space (tokens_per_block).
     assert [group.tokens_per_block for group in spec] == [128, 128]
+
+
+def test_conversion_mixed_arity_values_in_one_group() -> None:
+    """A 1-plane list beside a 2-plane tuple is classified per entry."""
+    lat = torch.randint(-128, 127, (32, 16, 1, 128), dtype=torch.int8)
+    scale = torch.randn(32, 16, 1, 1, dtype=torch.float16)
+    swa_name, swa_val = _single_plane("swa.0")
+    idx_name, idx_val = _single_plane("idx.0", width=128)
+    caches: dict[str, object] = {
+        swa_name: swa_val,
+        "mla.0": (lat, scale),
+        idx_name: idx_val,
+    }
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup([swa_name, "mla.0", idx_name], MockKVCacheSpec(16))
+            ]
+        ),
+        caches,
+        layout_hints={"kv_layout": "NHD"},
+    )
+    assert [g.engine_group_id for g in spec] == [0, 0, 0]
+    groups = {g.layer_indices for g in spec}
+    assert (1,) in groups
 
 
 def test_group_layers_by_identity_uses_per_layer_format():

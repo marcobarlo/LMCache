@@ -45,32 +45,51 @@ def test_flatten_passes_plain_tensors_through() -> None:
 
 
 def test_planes_per_layer_reads_uniform_tuple_arity() -> None:
-    assert kv_wrap.planes_per_layer({"l": (torch.zeros(1), torch.zeros(1))}) == 2
-    assert (
-        kv_wrap.planes_per_layer(
-            {"l": (torch.zeros(1), torch.zeros(1), torch.zeros(1))}
-        )
-        == 3
-    )
+    assert kv_wrap.planes_per_layer({"l": (torch.zeros(1), torch.zeros(1))}) == [2]
+    assert kv_wrap.planes_per_layer(
+        {"l": (torch.zeros(1), torch.zeros(1), torch.zeros(1))}
+    ) == [3]
 
 
 def test_planes_per_layer_defaults_for_flat_or_mixed_values() -> None:
-    assert kv_wrap.planes_per_layer({"l": torch.zeros(1)}) == 1
-    assert kv_wrap.planes_per_layer({}) == 1
-    # Mixed tuple / tensor values carry no single arity; keep the default so
-    # the server-side detection surfaces the inconsistency loudly.
-    assert (
-        kv_wrap.planes_per_layer(
-            {"a": (torch.zeros(1), torch.zeros(1)), "b": torch.zeros(1)}
-        )
-        == 1
+    assert kv_wrap.planes_per_layer({"l": torch.zeros(1)}) == [1]
+    assert kv_wrap.planes_per_layer({}) == []
+    assert kv_wrap.planes_per_layer(
+        {"a": (torch.zeros(1), torch.zeros(1)), "b": torch.zeros(1)}
+    ) == [2, 1]
+    assert kv_wrap.planes_per_layer(
+        {"a": (torch.zeros(1),), "b": (torch.zeros(1), torch.zeros(1))}
+    ) == [1, 2]
+
+
+def test_per_layer_planes_unwraps_arity_one_sequences() -> None:
+    a = torch.zeros(1)
+    b = torch.zeros(2)
+    c = torch.zeros(3)
+    out = kv_wrap.per_layer_planes(
+        {
+            "a": [a],
+            "b": (b, c),
+        }
     )
-    assert (
-        kv_wrap.planes_per_layer(
-            {"a": (torch.zeros(1),), "b": (torch.zeros(1), torch.zeros(1))}
-        )
-        == 1
-    )
+    assert out[0] is a
+    assert isinstance(out[1], tuple)
+    assert out[1][0] is b
+    assert out[1][1] is c
+
+
+def test_per_layer_planes_keeps_plain_tensor_entries() -> None:
+    a = torch.zeros(1)
+    b = torch.zeros(2)
+    out = kv_wrap.per_layer_planes({"a": a, "b": (b,)})
+    assert out == [a, b]
+
+
+def test_with_planes_per_layer_merges_mixed_arity_list() -> None:
+    hints = {"kv_layout": "NHD"}
+    merged = kv_wrap.with_planes_per_layer(hints, [1, 2, 1])
+    assert merged == {"kv_layout": "NHD", "planes_per_layer": [1, 2, 1]}
+    assert hints == {"kv_layout": "NHD"}
 
 
 def test_wrap_kv_caches_wraps_flattened_tuple_values(
@@ -89,9 +108,9 @@ def test_wrap_kv_caches_wraps_flattened_tuple_values(
 def test_with_planes_per_layer_merges_dict_hints() -> None:
     hints = {"kv_layout": "NHD"}
 
-    merged = kv_wrap.with_planes_per_layer(hints, 2)
+    merged = kv_wrap.with_planes_per_layer(hints, [2])
 
-    assert merged == {"kv_layout": "NHD", "planes_per_layer": 2}
+    assert merged == {"kv_layout": "NHD", "planes_per_layer": [2]}
     assert hints == {"kv_layout": "NHD"}  # input untouched
 
 
@@ -101,17 +120,17 @@ def test_with_planes_per_layer_merges_typeddict_hints() -> None:
 
     hints = LayoutHints(kv_layout="NHD")
 
-    merged = kv_wrap.with_planes_per_layer(hints, 3)
+    merged = kv_wrap.with_planes_per_layer(hints, [3])
 
-    assert merged == {"kv_layout": "NHD", "planes_per_layer": 3}
+    assert merged == {"kv_layout": "NHD", "planes_per_layer": [3]}
     assert hints == {"kv_layout": "NHD"}  # input untouched
 
 
 def test_with_planes_per_layer_is_noop_when_not_needed() -> None:
-    assert kv_wrap.with_planes_per_layer({"kv_layout": "NHD"}, 1) == {
+    assert kv_wrap.with_planes_per_layer({"kv_layout": "NHD"}, [1]) == {
         "kv_layout": "NHD"
     }
-    kept = {"planes_per_layer": 4}
-    assert kv_wrap.with_planes_per_layer(kept, 2) is kept
+    kept = {"planes_per_layer": [4]}
+    assert kv_wrap.with_planes_per_layer(kept, [2]) is kept
     non_dict = object()
-    assert kv_wrap.with_planes_per_layer(non_dict, 2) is non_dict
+    assert kv_wrap.with_planes_per_layer(non_dict, [2]) is non_dict

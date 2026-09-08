@@ -1707,6 +1707,12 @@ def _transfer_per_layer_mla(
                     layer.index_copy_(0, eff_idx, src_blocks)
 
 
+def _token_rows_as_uint8(rows: torch.Tensor, n_tokens: int) -> torch.Tensor:
+    """View ``[n_tokens, hidden_elems]`` as ``[n_tokens, hidden_bytes]`` uint8."""
+    contiguous = rows.contiguous()
+    return contiguous.view(torch.uint8).view(n_tokens, -1)
+
+
 def _transfer_per_layer_mla_tuple(
     layer_planes: "list[tuple[torch.Tensor, ...] | list[torch.Tensor]]",
     object_tensors: list[torch.Tensor],
@@ -1721,9 +1727,10 @@ def _transfer_per_layer_mla_tuple(
 
     Each layer arrives as a tuple of paged planes (MLA: ``latent, rope``;
     DSA: ``latent, rope, dsa``). The staging objects are rank-3
-    ``[L, tokens, sum(W_p)]``: plane ``p`` of layer ``l`` occupies the
-    column slab ``[sum(W_q for q < p) : sum(W_q for q <= p)]``. Valid-block
-    and skip handling mirror :func:`_transfer_per_layer_mla`.
+    ``[L, tokens, hidden]`` where ``hidden`` is the plane byte-total measured
+    in the object dtype (homogeneous: ``sum(W_p)``). Plane ``p`` occupies the
+    byte slab ``[sum(nbytes_q for q < p) : ...)``. Valid-block and skip
+    handling mirror :func:`_transfer_per_layer_mla`.
     """
     if not layer_planes or not object_tensors:
         return
@@ -1743,34 +1750,43 @@ def _transfer_per_layer_mla_tuple(
             continue
         idx_start, idx_end, offset_in_object = valid
         n_valid = idx_end - idx_start
-        token_end = offset_in_object + n_valid * block_size
+        n_tokens = n_valid * block_size
+        token_end = offset_in_object + n_tokens
         eff_idx = block_ids_dev[idx_start:idx_end]
 
         if is_d2h:
             for layer_idx, planes in enumerate(layer_planes):
-                slab_offset = 0
+                row_u8 = _token_rows_as_uint8(
+                    obj[layer_idx, offset_in_object:token_end], n_tokens
+                )
+                byte_off = 0
                 for plane in planes:
                     width = int(plane.shape[-1])
-                    # [n_valid, BS, ..., W_p] -> [n_valid * BS, W_p]
-                    selected = torch.index_select(plane, 0, eff_idx).reshape(-1, width)
-                    token_rows = obj[layer_idx, offset_in_object:token_end]
-                    token_rows[:, slab_offset : slab_offset + width].copy_(
-                        selected, non_blocking=True
+                    nbytes = width * int(plane.element_size())
+                    selected = (
+                        torch.index_select(plane, 0, eff_idx)
+                        .reshape(n_tokens, -1)
+                        .contiguous()
                     )
-                    slab_offset += width
+                    selected_u8 = selected.view(torch.uint8).view(n_tokens, nbytes)
+                    row_u8[:, byte_off : byte_off + nbytes].copy_(
+                        selected_u8, non_blocking=True
+                    )
+                    byte_off += nbytes
         else:
             chunk_gpu = obj[:, offset_in_object:token_end].to(
                 target_device, non_blocking=True
             )
             for layer_idx, planes in enumerate(layer_planes):
-                slab_offset = 0
+                row_u8 = _token_rows_as_uint8(chunk_gpu[layer_idx], n_tokens)
+                byte_off = 0
                 for plane in planes:
                     width = int(plane.shape[-1])
-                    src = chunk_gpu[layer_idx][
-                        :, slab_offset : slab_offset + width
-                    ].reshape(n_valid, *plane.shape[1:])
+                    nbytes = width * int(plane.element_size())
+                    src_u8 = row_u8[:, byte_off : byte_off + nbytes].contiguous()
+                    src = src_u8.view(plane.dtype).view(n_valid, *plane.shape[1:])
                     plane.index_copy_(0, eff_idx, src)
-                    slab_offset += width
+                    byte_off += nbytes
 
 
 def _transfer_per_layer_hnd(
