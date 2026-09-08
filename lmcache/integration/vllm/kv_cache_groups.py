@@ -32,6 +32,35 @@ def _is_attention_spec(spec: Any) -> bool:
     return any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
 
 
+def _iter_layer_specs(group_spec: Any):
+    """Yield leaf specs, unwrapping ``UniformTypeKVCacheSpecs`` containers."""
+    inner = getattr(group_spec, "kv_cache_specs", None)
+    if isinstance(inner, dict):
+        yield from inner.values()
+        return
+    yield group_spec
+
+
+def _physical_block_size_multiplier(kv_cache_spec: Any) -> int:
+    """Multiplier for specs whose ``block_size`` is physical slots.
+
+    Upstream vLLM compressed specs keep ``block_size`` in logical-token
+    units. Ascend specs report physical slots and expose logical span via
+    ``compress_ratio``; apply that multiplier only for Ascend leaf specs.
+    """
+    specs = list(_iter_layer_specs(kv_cache_spec))
+    if not specs:
+        return 1
+    has_ascend = any(
+        any(cls.__name__.startswith("Ascend") for cls in type(spec).__mro__)
+        for spec in specs
+    )
+    if not has_ascend:
+        return 1
+    ratios = [int(getattr(spec, "compress_ratio", 1) or 1) for spec in specs]
+    return max(ratios) if ratios else 1
+
+
 def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     """Global tokens covered by one block id of ``kv_cache_spec``.
 
@@ -39,7 +68,7 @@ def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     (vLLM's ``resolve_kv_cache_block_sizes`` rule); recurrent state is
     replicated, not sharded, and stays at ``block_size``.
     """
-    block_size = kv_cache_spec.block_size
+    block_size = kv_cache_spec.block_size * _physical_block_size_multiplier(kv_cache_spec)
     if dcp_size <= 1:
         return block_size
     if _is_attention_spec(kv_cache_spec):
