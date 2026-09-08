@@ -2,7 +2,6 @@
 """CPU-only tests for NPU cache-context helpers (no Ascend hardware)."""
 
 # Standard
-from types import SimpleNamespace
 from typing import Any
 
 # Third Party
@@ -91,41 +90,26 @@ def test_temp_buffer_object_group_view_is_contiguous_union() -> None:
     assert buffer.max_batch_size == 2
 
 
-def test_kernel_group_kv_pointers_returns_per_layer_plane_views() -> None:
-    """The "pointer table" is the per-layer plane entries themselves.
-
-    The fallback transfer path consumes per-layer structures, so the method
-    must return the imported plane tensors (identity, zero-copy), not an
-    int64 pointer table: per-plane widths for the MLA/DSA tuple format are
-    unrecoverable from pointers.
-    """
+def test_kernel_group_kv_pointers_returns_int64_pointer_table() -> None:
+    """CUDA-shaped device int64 table, not nested plane views."""
     # First Party
     from lmcache.v1.platform.npu.cache_context import NpuCacheContext
 
-    latent, rope = torch.zeros(2), torch.zeros(3)
-    other_latent, other_rope = torch.zeros(2), torch.zeros(3)
+    table = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
 
     class _TestContext(NpuCacheContext):
         def __init__(self) -> None:
-            self.kv_caches_ = [  # type: ignore[assignment]
-                (latent, rope),
-                (other_latent, other_rope),
-            ]
-            self.kv_layer_groups_manager_ = SimpleNamespace(  # type: ignore[assignment]
-                kernel_groups=[SimpleNamespace(layer_indices=[0, 1])]
-            )
+            self.group_kv_pointers_ = [table]  # type: ignore[assignment]
 
     context = _TestContext()
 
     entries = context.get_kernel_group_kv_pointers(0)
 
-    assert isinstance(entries, list)
-    assert len(entries) == 2
-    # Identity, not copies: the fallback reads/writes these exact views.
-    assert entries[0][0] is latent
-    assert entries[0][1] is rope
-    assert entries[1][0] is other_latent
-    assert entries[1][1] is other_rope
+    assert isinstance(entries, torch.Tensor)
+    assert entries.dtype == torch.int64
+    assert entries.dim() == 1
+    assert entries.numel() == 4
+    assert entries.data_ptr() == table.data_ptr()
 
 
 def test_close_synchronizes_before_releasing_ipc_owners() -> None:
