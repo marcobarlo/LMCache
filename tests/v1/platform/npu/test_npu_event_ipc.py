@@ -2,7 +2,8 @@
 """CPU-only tests for the NPU event IPC backend (no Ascend hardware)."""
 
 # Standard
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 # Third Party
 import pytest
@@ -54,6 +55,29 @@ class _FakeEvent:
 
 class _FakeNpuModule:
     Event = _FakeEvent
+    # Mimics torch.npu's thread-local current device; "ambient" stands in for
+    # whatever device the calling thread happened to be on.
+    current_device: Any = "ambient"
+
+    @contextmanager
+    def device(self, device: Any) -> Iterator[None]:
+        """Mimic ``torch.npu.device``: pin ``current_device`` for the block."""
+        previous = _FakeNpuModule.current_device
+        _FakeNpuModule.current_device = device
+        try:
+            yield
+        finally:
+            _FakeNpuModule.current_device = previous
+
+
+class _DevicePinningEvent(_FakeEvent):
+    """Records the module's current device at ``ipc_handle()`` time."""
+
+    seen_device: Any = "never-exported"
+
+    def ipc_handle(self) -> bytes:
+        _DevicePinningEvent.seen_device = _FakeNpuModule.current_device
+        return super().ipc_handle()
 
 
 class _AbiLessModule:
@@ -131,6 +155,25 @@ def test_device_spec_exposes_cached_event_backend(
     first = spec.event_ipc_backend
     assert first.device_type == "npu"
     assert spec.event_ipc_backend is first
+
+
+def test_export_serializes_under_the_requested_device() -> None:
+    """CANN derives an interprocess handle from the thread's current device,
+    so export_event must pin ``device`` current for the ipc_handle() call
+    regardless of the caller's ambient device."""
+    from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
+
+    class _PinningModule(_FakeNpuModule):
+        Event = _DevicePinningEvent
+
+    backend = NpuEventIPCBackend(event_module=_PinningModule())
+    event = backend.create_event(_device())
+    handle = backend.export_event(event, "npu:3")
+
+    assert handle == b"npu-handle"
+    assert _DevicePinningEvent.seen_device == "npu:3"
+    # The caller's ambient device is restored after the export.
+    assert _FakeNpuModule.current_device == "ambient"
 
 
 def test_export_pins_source_events_in_bounded_cache() -> None:

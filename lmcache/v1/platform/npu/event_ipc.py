@@ -67,6 +67,11 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
     def export_event(self, event: object, device: object) -> bytes:
         """Serialize an event for another process, keeping the source alive.
 
+        Unlike CUDA, where an event carries its own device, CANN derives an
+        interprocess handle from the calling thread's current device, so the
+        serialization runs with ``device`` pinned current regardless of the
+        caller's ambient device (e.g. a multi-device server handler thread).
+
         Args:
             event: Backend-native event to export.
             device: Device that owns the event.
@@ -74,7 +79,8 @@ class NpuEventIPCBackend(DefaultEventIPCBackend):
         Returns:
             Serialized event handle.
         """
-        handle = super().export_event(event, device)
+        with self._event_module.device(device):  # type: ignore[attr-defined]
+            handle = super().export_event(event, device)
         self._exported_events.append(event)
         return handle
 
