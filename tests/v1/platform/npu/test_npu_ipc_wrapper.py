@@ -46,12 +46,13 @@ def test_device_spec_binds_npu_ipc_wrapper() -> None:
     assert issubclass(NpuIPCWrapper, DeviceIPCWrapper)
 
 
+@pytest.mark.parametrize("n_planes", [1, 2, 3], ids=["bare", "kv", "dsa"])
 def test_wrap_classmethod_builds_instance_per_plane(
+    n_planes: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``wrap`` keeps one record per plane, in registration order."""
-    k = torch.zeros(2, 3)
-    v = torch.ones(2, 3)
+    planes = tuple(torch.zeros(2, 3) for _ in range(n_planes))
     shared_ptrs: list[int] = []
 
     class _FakeStorage:
@@ -71,14 +72,17 @@ def test_wrap_classmethod_builds_instance_per_plane(
         NpuIPCWrapper, "_get_device_uuid", staticmethod(lambda idx: "npu-test-0")
     )
 
-    wrapper = NpuIPCWrapper.wrap((k, v))
+    value: torch.Tensor | tuple[torch.Tensor, ...] = (
+        planes[0] if n_planes == 1 else planes
+    )
+    wrapper = NpuIPCWrapper.wrap(value)
 
     assert wrapper.device_uuid == "npu-test-0"
-    assert shared_ptrs == [k.data_ptr(), v.data_ptr()]
+    assert shared_ptrs == [plane.data_ptr() for plane in planes]
     records = wrapper._plane_records  # noqa: SLF001 (arity under test)
-    assert len(records) == 2
-    assert [r[2] for r in records] == [(2, 3), (2, 3)]
-    assert [r[1] for r in records] == [torch.float32, torch.float32]
+    assert len(records) == n_planes
+    assert [r[2] for r in records] == [(2, 3)] * n_planes
+    assert [r[1] for r in records] == [torch.float32] * n_planes
 
 
 def test_wrap_rejects_empty_plane_sequence() -> None:

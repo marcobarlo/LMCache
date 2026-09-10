@@ -6,10 +6,16 @@ from typing import Any
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.v1.platform.base.event_ipc import EventIPCBackend
 from lmcache.v1.platform.npu import NpuDeviceSpec
+from lmcache.v1.platform.npu import event_ipc
+from lmcache.v1.platform.npu.event_ipc import (
+    _EXPORT_LIVENESS_CACHE,
+    NpuEventIPCBackend,
+)
 
 pytestmark = pytest.mark.no_shared_allocator
 
@@ -20,25 +26,30 @@ class _FakeEvent:
     def __init__(self, interprocess: bool = False) -> None:
         if not interprocess:
             raise ValueError("fake events must be interprocess")
+        self.calls: list[tuple[Any, ...]] = []
 
     @classmethod
     def from_ipc_handle(cls, device: Any, handle: bytes) -> "_FakeEvent":
-        return cls(interprocess=True)
+        event = cls(interprocess=True)
+        event.calls.append(("from_ipc_handle", device, handle))
+        return event
 
     def ipc_handle(self) -> bytes:
+        self.calls.append(("ipc_handle",))
         return b"npu-handle"
 
     def record(self, stream: Any = None) -> None:
-        pass
+        self.calls.append(("record", stream))
 
     def wait(self, stream: Any = None) -> None:
-        pass
+        self.calls.append(("wait", stream))
 
     def query(self) -> bool:
+        self.calls.append(("query",))
         return True
 
     def synchronize(self) -> None:
-        pass
+        self.calls.append(("synchronize",))
 
 
 class _FakeNpuModule:
@@ -58,31 +69,23 @@ def _device() -> Any:
 
 
 def test_backend_satisfies_protocol() -> None:
-    from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
-
     backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
     assert isinstance(backend, EventIPCBackend)
     assert backend.device_type == "npu"
 
 
 def test_check_event_support_fails_closed_without_abi() -> None:
-    from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
-
     backend = NpuEventIPCBackend(event_module=_AbiLessModule())
     with pytest.raises(RuntimeError, match="interprocess"):
         backend.check_event_support(_device())
 
 
 def test_check_event_support_passes_with_abi() -> None:
-    from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
-
     backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
     backend.check_event_support(_device())
 
 
 def test_backend_creates_exports_and_imports() -> None:
-    from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
-
     backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
     event = backend.create_event(_device())
     handle = backend.export_event(event, _device())
@@ -91,13 +94,30 @@ def test_backend_creates_exports_and_imports() -> None:
     assert isinstance(imported, _FakeEvent)
 
 
+def test_event_operations_delegate_to_torch_npu() -> None:
+    """NPU operations use the torch_npu interprocess Event API."""
+    backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
+    device = _device()
+
+    backend.check_event_support(device)
+    event = backend.create_event(device)
+    assert backend.export_event(event, device) == b"npu-handle"
+    remote = backend.import_event(b"npu-handle", device)
+    backend.record_event(event, "STREAM")
+    backend.wait_event(remote, "STREAM")
+    assert backend.query_event(remote) is True
+    backend.synchronize_event(remote, device)
+
+    assert ("record", "STREAM") in event.calls
+    assert ("wait", "STREAM") in remote.calls
+    assert ("query",) in remote.calls
+    assert ("synchronize",) in remote.calls
+    assert ("from_ipc_handle", device, b"npu-handle") in remote.calls
+
+
 def test_torch_npu_module_raises_without_torch_npu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import torch
-
-    from lmcache.v1.platform.npu import event_ipc
-
     monkeypatch.delattr(torch, "npu", raising=False)
     with pytest.raises(RuntimeError, match="torch_npu"):
         event_ipc._torch_npu_module()
@@ -106,8 +126,6 @@ def test_torch_npu_module_raises_without_torch_npu(
 def test_device_spec_exposes_cached_event_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from lmcache.v1.platform.npu import event_ipc
-
     monkeypatch.setattr(event_ipc, "_torch_npu_module", lambda: _FakeNpuModule())
     spec = NpuDeviceSpec()
     first = spec.event_ipc_backend
@@ -117,11 +135,6 @@ def test_device_spec_exposes_cached_event_backend(
 
 def test_export_pins_source_events_in_bounded_cache() -> None:
     """CANN invalidates a handle once its source event is destroyed."""
-    from lmcache.v1.platform.npu.event_ipc import (
-        _EXPORT_LIVENESS_CACHE,
-        NpuEventIPCBackend,
-    )
-
     backend = NpuEventIPCBackend(event_module=_FakeNpuModule())
     events = [backend.create_event(_device()) for _ in range(3)]
     for event in events:

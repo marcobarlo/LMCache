@@ -12,7 +12,7 @@ import torch
 
 # First Party
 from lmcache.utils import EngineType
-from lmcache.v1.gpu_connector.utils import normalize_and_discover_per_layer_formats
+from lmcache.v1.gpu_connector.utils import get_shape_and_dtype, normalize_and_discover_per_layer_formats
 import lmcache.lmcache_native as lmcache_native
 
 NB, NL, BS, NH, HS = 7, 5, 3, 2, 4
@@ -86,67 +86,25 @@ def test_vllm_mixed_rank4_fused_groups():
     assert formats == [F.NL_X_NB_NH_BS_CS] * 5
 
 
-# ====================================================================== #
-#  get_shape_and_dtype: shared structure walker                          #
-# ====================================================================== #
-
-
-def test_get_shape_and_dtype_bare_tensor_entry() -> None:
-    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
-
-    entry = torch.zeros(NB, BS, NH, HS, dtype=DT)
-    assert get_shape_and_dtype([entry]) == [((NB, BS, NH, HS), DT)]
-
-
-def test_get_shape_and_dtype_plane_tuple_entry() -> None:
-    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
+def test_get_shape_and_dtype_is_the_per_layer_grouping_key():
+    # Same walker normalize_and_discover_per_layer_formats uses to bucket
+    # mixed layouts in one engine group: recursive (shape, dtype) leaves.
+    # A plane tuple (MLA int8+f16) and a nested K/V-split must not collapse.
+    bare = _t(NB, BS, NH, HS)
+    assert get_shape_and_dtype([bare]) == [((NB, BS, NH, HS), DT)]
 
     latent = torch.zeros(NB, BS, 1, 8, dtype=torch.int8)
     rope = torch.zeros(NB, BS, 1, 2, dtype=torch.float16)
     assert get_shape_and_dtype([(latent, rope)]) == [
         (((NB, BS, 1, 8), torch.int8), ((NB, BS, 1, 2), torch.float16))
     ]
-
-
-def test_get_shape_and_dtype_walks_nested_sequences() -> None:
-    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
-
-    a = torch.zeros(2, 3, dtype=DT)
-    b = torch.zeros(4, 5, dtype=DT)
-    # A deeper (K/V-split style) nesting is walked recursively.
+    a, b = _t(2, 3), _t(4, 5)
     assert get_shape_and_dtype([[a, b]]) == [(((2, 3), DT), ((4, 5), DT))]
 
+    entries = [_t(2), _t(3), _t(4)]
+    assert get_shape_and_dtype(entries, [2, 0]) == [((4,), DT), ((2,), DT)]
+    assert get_shape_and_dtype(entries) == [((2,), DT), ((3,), DT), ((4,), DT)]
 
-def test_get_shape_and_dtype_layer_indices_select_and_order() -> None:
-    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
-
-    entries = [
-        torch.zeros(2, dtype=DT),
-        torch.zeros(3, dtype=DT),
-        torch.zeros(4, dtype=DT),
-    ]
-    assert get_shape_and_dtype(entries, [2, 0]) == [
-        ((4,), DT),
-        ((2,), DT),
-    ]
-    # ``None`` selects every entry, in registration order.
-    assert get_shape_and_dtype(entries) == [
-        ((2,), DT),
-        ((3,), DT),
-        ((4,), DT),
-    ]
-
-
-def test_get_shape_and_dtype_distinguishes_same_shape_dtypes() -> None:
-    """Shape-equal but dtype-different entries get different structures.
-
-    This is the grouping key of ``normalize_and_discover_per_layer_formats``:
-    differing dtypes must never share one detection pass.
-    """
-    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
-
-    fp16 = torch.zeros(NB, BS, HS, dtype=torch.float16)
-    bf16 = torch.zeros(NB, BS, HS, dtype=torch.bfloat16)
+    fp16, bf16 = _t(NB, BS, HS), torch.zeros(NB, BS, HS, dtype=torch.bfloat16)
     keys = get_shape_and_dtype([fp16, fp16.clone(), bf16])
-    assert keys[0] == keys[1]
-    assert keys[0] != keys[2]
+    assert keys[0] == keys[1] and keys[0] != keys[2]

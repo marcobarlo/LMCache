@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only tests for NPU stream-ordered completion recording."""
 
+# Standard
+import sys
+import types
+
 # Third Party
 import pytest
 
@@ -10,6 +14,18 @@ from lmcache.v1.platform.npu import device_ops as npu_device_ops_module
 from lmcache.v1.platform.npu.device_ops import NpuDeviceOps
 
 pytestmark = pytest.mark.no_shared_allocator
+
+
+def _install_fake_c_ops(
+    monkeypatch: pytest.MonkeyPatch, **symbols: object
+) -> None:
+    fake_c_ops = types.ModuleType("lmcache_ascend.c_ops")
+    for name, value in symbols.items():
+        setattr(fake_c_ops, name, value)
+    fake_pkg = types.ModuleType("lmcache_ascend")
+    fake_pkg.c_ops = fake_c_ops
+    monkeypatch.setitem(sys.modules, "lmcache_ascend", fake_pkg)
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake_c_ops)
 
 
 def test_record_completion_syncs_stream_before_enqueue(
@@ -49,8 +65,11 @@ def test_record_event_syncs_stream_before_enqueue(
     assert calls == [("sync", 0xBEEF)]
     events = ops.drain_recorded_events()
     assert len(events) == 1
-    assert events[0][0] == "mp.store.start"
-    assert events[0][1] == "session"
+    event_type, session_id, _timestamp, string_metadata, int_metadata = events[0]
+    assert event_type == "mp.store.start"
+    assert session_id == "session"
+    assert string_metadata == {"device": "npu"}
+    assert int_metadata == {"engine_id": 1}
 
 
 def test_sync_helper_raises_on_acl_error(
@@ -61,17 +80,24 @@ def test_sync_helper_raises_on_acl_error(
         def synchronize_stream(ptr: int) -> int:
             return 507899
 
-    import types
-
     fake_acl = types.ModuleType("acl")
     fake_acl.rt = _FailingRt
-    monkeypatch.setitem(__import__("sys").modules, "acl", fake_acl)
+    monkeypatch.setitem(sys.modules, "acl", fake_acl)
     with pytest.raises(RuntimeError, match="507899"):
         npu_device_ops_module._synchronize_npu_stream_pointer(7)
 
 
-def test_c_ops_torch_reexports_do_not_shadow_stream_ordered_recorders(
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "record_completion_on_stream",
+        "record_event_on_stream",
+        "lmcache_memcpy_async",
+    ],
+)
+def test_c_ops_torch_reexports_are_not_instance_bound(
     monkeypatch: pytest.MonkeyPatch,
+    symbol: str,
 ) -> None:
     """Plugin re-exports of the torch fallback must not defeat the overrides.
 
@@ -80,23 +106,14 @@ def test_c_ops_torch_reexports_do_not_shadow_stream_ordered_recorders(
     them over the class-level sync-ordered overrides whenever ``lmcache``
     is imported before the plugin (the natural server-process order).
     """
-    # Standard
-    import sys
-    import types
-
-    fake_c_ops = types.ModuleType("lmcache_ascend.c_ops")
-    fake_c_ops.record_completion_on_stream = torch_ops.record_completion_on_stream
-    fake_c_ops.record_event_on_stream = torch_ops.record_event_on_stream
-    fake_pkg = types.ModuleType("lmcache_ascend")
-    fake_pkg.c_ops = fake_c_ops
-    monkeypatch.setitem(sys.modules, "lmcache_ascend", fake_pkg)
-    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake_c_ops)
+    _install_fake_c_ops(monkeypatch, **{symbol: getattr(torch_ops, symbol)})
 
     ops = NpuDeviceOps()
     ops.ensure_native()
-    for name in ("record_completion_on_stream", "record_event_on_stream"):
-        assert name not in vars(ops)
+    assert symbol not in vars(ops)
 
+    if symbol != "record_completion_on_stream":
+        return
     calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         npu_device_ops_module,
@@ -111,9 +128,6 @@ def test_genuine_native_recorder_binding_is_kept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A real native recorder must survive the re-export cleanup."""
-    # Standard
-    import sys
-    import types
 
     def _native_recorder(stream_ptr: int, kind: str, payload: bytes) -> None:
         pass
@@ -121,40 +135,13 @@ def test_genuine_native_recorder_binding_is_kept(
     def _native_event_recorder(*args: object) -> None:
         pass
 
-    fake_c_ops = types.ModuleType("lmcache_ascend.c_ops")
-    fake_c_ops.record_completion_on_stream = _native_recorder
-    fake_c_ops.record_event_on_stream = _native_event_recorder
-    fake_pkg = types.ModuleType("lmcache_ascend")
-    fake_pkg.c_ops = fake_c_ops
-    monkeypatch.setitem(sys.modules, "lmcache_ascend", fake_pkg)
-    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake_c_ops)
+    _install_fake_c_ops(
+        monkeypatch,
+        record_completion_on_stream=_native_recorder,
+        record_event_on_stream=_native_event_recorder,
+    )
 
     ops = NpuDeviceOps()
     ops.ensure_native()
     assert ops.__dict__["record_completion_on_stream"] is _native_recorder
     assert ops.__dict__["record_event_on_stream"] is _native_event_recorder
-
-
-def test_c_ops_torch_reexport_of_memcpy_is_dropped_too(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The merged torch-fallback lmcache_memcpy_async must not shadow the
-    NPU pointer-mode override (libcudart cannot copy NPU memory)."""
-    # Standard
-    import sys
-    import types
-
-    fake_c_ops = types.ModuleType("lmcache_ascend.c_ops")
-    setattr(
-        fake_c_ops,
-        "lmcache_memcpy_async",
-        torch_ops.lmcache_memcpy_async,
-    )
-    fake_pkg = types.ModuleType("lmcache_ascend")
-    setattr(fake_pkg, "c_ops", fake_c_ops)
-    monkeypatch.setitem(sys.modules, "lmcache_ascend", fake_pkg)
-    monkeypatch.setitem(sys.modules, "lmcache_ascend.c_ops", fake_c_ops)
-
-    ops = NpuDeviceOps()
-    ops.ensure_native()
-    assert "lmcache_memcpy_async" not in vars(ops)
