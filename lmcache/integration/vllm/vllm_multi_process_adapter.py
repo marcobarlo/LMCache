@@ -41,7 +41,6 @@ from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 from lmcache.v1.platform.cuda.vmm_ipc import set_use_vmm_api
 from lmcache.v1.platform.isolated_ipc import set_isolated_ipc
-from lmcache.v1.platform.kv_wrap import planes_per_layer, with_planes_per_layer
 
 if TYPE_CHECKING:
     # First Party
@@ -1403,12 +1402,6 @@ class LMCacheMPWorkerAdapter:
         # Reused when heartbeat recovery re-registers.
         self._layout_hints = (
             layout_hints if layout_hints is not None else vllm_layout_hints()
-        )
-        # vLLM-Ascend hands per-layer plane tuples (e.g. (K, V) pairs); the
-        # wrapper list is flattened on the wire, so the server needs the
-        # plane arity in the hints to regroup it back into layers.
-        self._layout_hints = with_planes_per_layer(
-            self._layout_hints, planes_per_layer(kv_caches)
         )
         self._send_register_kv_caches_request(kv_caches)
 

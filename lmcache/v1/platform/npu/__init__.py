@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     from lmcache.v1.platform.base.device_ops import DeviceOps
     from lmcache.v1.platform.base.event_ipc import EventIPCBackend
+    from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper
 
 # ---------------------------------------------------------------------------
 # Device detection registry entry
@@ -57,6 +58,14 @@ class NpuDeviceSpec(DeviceSpec):
     @property
     def pin_memory_backend(self) -> type[PinMemoryBackend] | None:
         return NpuPinMemoryBackend
+
+    @property
+    def ipc_wrapper_cls(self) -> "type[NpuIPCWrapper]":
+        """Plane-aggregating KV-cache IPC wrapper for Ascend."""
+        # First Party
+        from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper
+
+        return NpuIPCWrapper
 
     @property
     def event_ipc_backend(self) -> "EventIPCBackend":

@@ -8,7 +8,7 @@
 # mypy: disable-error-code="union-attr,call-overload"
 # Standard
 from collections.abc import Hashable, Sequence
-from typing import TYPE_CHECKING, Optional, Union, cast
+from typing import TYPE_CHECKING, Optional, Union
 
 # Third Party
 import torch
@@ -212,60 +212,53 @@ def normalize_kv_and_discover_format(
     return detect_format(kv_caches, serving_engine, layout_hints)
 
 
-def _regroup_planes_per_layer(
-    kv_caches: "DiscoverableKVCache",
-    planes_per_layer: list[int],
-) -> "DiscoverableKVCache":
-    """Regroup a flat per-plane registration list into per-layer tuples.
-
-    Engines with tuple KV layouts (vLLM-Ascend MLA/DSA) may register their
-    paged planes as one flat tensor list (layer 0's planes, then layer 1's,
-    ...). Detection classifies per-layer tuple structures, so consecutive
-    planes are bundled by the per-layer counts in ``planes_per_layer``.
-    Arity-1 slices unwrap to a bare tensor. Any other input shape (a
-    single tensor, already-grouped tuples, nested lists) is returned
-    unchanged.
-
-    Args:
-        kv_caches: The registered KV caches.
-        planes_per_layer: Per-layer plane counts from the layout hint.
-
-    Returns:
-        The regrouped per-layer list when ``kv_caches`` is a flat list of
-        tensors; ``kv_caches`` unchanged otherwise.
-
-    Raises:
-        ValueError: If a count is not positive, or the flat list length
-            does not match ``sum(planes_per_layer)``.
-    """
-    if any(n < 1 for n in planes_per_layer):
-        raise ValueError(
-            f"planes_per_layer layout hint must be >= 1, got {planes_per_layer}"
-        )
-    if not isinstance(kv_caches, list) or not all(
-        isinstance(entry, torch.Tensor) for entry in kv_caches
-    ):
-        return kv_caches
-    if sum(planes_per_layer) != len(kv_caches):
-        raise ValueError(
-            f"planes_per_layer sum {sum(planes_per_layer)} != "
-            f"registered plane count ({len(kv_caches)})"
-        )
-    offset = 0
-    grouped: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
-    for n in planes_per_layer:
-        chunk = kv_caches[offset : offset + n]
-        offset += n
-        grouped.append(chunk[0] if n == 1 else tuple(chunk))
-    return cast("DiscoverableKVCache", grouped)
-
-
 def _layer_structure_key(entry: object) -> Hashable:
-    """Hashable key that distinguishes tuples/lists from plain tensors."""
+    """Hashable per-layer structure key: recursive ``(shape, dtype)`` leaves.
+
+    Sequence entries (plane tuples/lists, deeper nesting) produce the tuple
+    of their children's keys; a bare tensor produces
+    ``((dim, ...), dtype)``. Two entries share a key exactly when their
+    shapes *and* dtypes match, so layers of one key can safely share one
+    format-detection pass. Non-tensor leaves without a ``shape`` attribute
+    yield ``None``.
+    """
     if isinstance(entry, (list, tuple)):
         return tuple(_layer_structure_key(item) for item in entry)
     shape = getattr(entry, "shape", None)
-    return tuple(shape) if shape is not None else None
+    if shape is None:
+        return None
+    dtype = getattr(entry, "dtype", None)
+    return (tuple(shape), dtype)
+
+
+def get_shape_and_dtype(
+    kv_caches: "DiscoverableKVCache",
+    layer_indices: "Optional[Sequence[int]]" = None,
+) -> list[Hashable]:
+    """Return the shape/dtype structure of each requested layer's entry.
+
+    Like :func:`get_device`, this walks the nesting without needing a
+    detected format: a bare-tensor entry yields ``((dim, ...), dtype)``,
+    and a plane sequence yields the recursively built tuple of its planes'
+    structures -- e.g. ``(((nb, bs, 1, 128), torch.int8),
+    ((nb, bs, 1, 1), torch.float16))`` for an MLA ``(latent, rope)``
+    registration. The returned values are hashable and equality means
+    "same shapes and dtypes", which is also the structure
+    :func:`normalize_and_discover_per_layer_formats` groups layers by.
+
+    Args:
+        kv_caches: Per-layer KV entries (tensor or nested sequences).
+        layer_indices: 0-based entries to describe, in the given order;
+            ``None`` (or omitted) selects every entry.
+
+    Returns:
+        One structure per requested layer, in order.
+    """
+    entries = list(kv_caches)  # type: ignore[arg-type]
+    indices: "Sequence[int]" = (
+        range(len(entries)) if layer_indices is None else layer_indices
+    )
+    return [_layer_structure_key(entries[i]) for i in indices]
 
 
 def normalize_and_discover_per_layer_formats(
@@ -282,29 +275,20 @@ def normalize_and_discover_per_layer_formats(
     model-wide one.
 
     Args:
-        kv_caches: The registered KV caches: a per-layer list, or a single fused
-            tensor for cross-layer formats.
+        kv_caches: The registered KV caches: a per-layer list (entries are
+            bare tensors or per-layer plane tuples, e.g. vLLM-Ascend's
+            ``(latent, rope)``), or a single fused tensor for cross-layer
+            formats.
         layer_index_groups: Layer indices of each engine group (one inner
             sequence per group). Empty means a single non-hybrid group.
         serving_engine: Which serving engine produced the caches.
-        layout_hints: See :class:`LayoutHints`. When ``planes_per_layer``
-            is a non-empty list and ``kv_caches`` is a flat list of paged
-            plane tensors, consecutive planes are regrouped into per-layer
-            tuples before classification (arity-1 slices unwrap).
+        layout_hints: See :class:`LayoutHints`.
 
     Returns:
         ``(normalized_kv_caches, engine_kv_formats)``: the canonical KV cache
         structure and one format per layer (length equals the layer count),
         ready for :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`.
-
-    Raises:
-        ValueError: If a ``planes_per_layer`` count is not positive, or a
-            flat plane list length does not match the sum of counts.
     """
-    planes_per_layer = (layout_hints or {}).get("planes_per_layer") or []
-    if planes_per_layer:
-        kv_caches = _regroup_planes_per_layer(kv_caches, list(planes_per_layer))
-
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.
     extracted_shapes = extract_kv_cache_shapes(kv_caches)
@@ -317,17 +301,18 @@ def normalize_and_discover_per_layer_formats(
                 whole_normalized, whole_format
             )
 
-    # Per-layer list: re-detect per engine group, split by tensor shape so a group
-    # that mixes layouts gets the right format per layer.
+    # Per-layer list: re-detect per engine group, split by each layer's
+    # shape/dtype structure (see get_shape_and_dtype) so a group that mixes
+    # layouts gets the right format per layer.
     groups = layer_index_groups or [range(len(kv_caches))]
+    structure_keys = get_shape_and_dtype(kv_caches)
     detected: dict[
         int, tuple[DiscoverableKVCache, "lmcache_native.EngineKVFormat"]
     ] = {}
     for indices in groups:
         layers_by_shape: dict[Hashable, list[int]] = {}
         for i in indices:
-            key = _layer_structure_key(kv_caches[i])
-            layers_by_shape.setdefault(key, []).append(i)
+            layers_by_shape.setdefault(structure_keys[i], []).append(i)
         for same_shape_indices in layers_by_shape.values():
             fmt, normalized = detect_format(
                 [kv_caches[i] for i in same_shape_indices],
