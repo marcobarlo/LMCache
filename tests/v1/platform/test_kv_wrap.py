@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only tests for KV-cache wrapping of per-layer tuple values."""
+"""CPU-only tests for per-layer KV-cache wrapping on the worker side."""
 
 # Standard
 from typing import Any
@@ -16,50 +16,94 @@ pytestmark = pytest.mark.no_shared_allocator
 
 class _RecordingFactory:
     def __init__(self) -> None:
-        self.wrapped: list[torch.Tensor] = []
+        self.wrapped: list[Any] = []
 
-    def __call__(self, tensor: torch.Tensor) -> Any:
-        self.wrapped.append(tensor)
+    def __call__(self, value: Any) -> Any:
+        self.wrapped.append(value)
         return f"wrapper-{len(self.wrapped)}"
 
 
-def test_flatten_expands_per_layer_tuples_in_order() -> None:
+def test_wrap_one_kv_cache_dispatches_on_value_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _RecordingFactory()
+    monkeypatch.setattr(kv_wrap, "resolve_kv_wrapper_factory", lambda _: factory)
+
+    tensor = torch.zeros(2)
+    assert kv_wrap.wrap_one_kv_cache(tensor) == "wrapper-1"
+    assert factory.wrapped == [tensor]
+
+
+def test_wrap_one_kv_cache_dispatches_sequence_on_first_plane_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-layer plane sequence dispatches on its first tensor's device."""
+    factory = _RecordingFactory()
+    seen_types: list[str] = []
+    orig = factory
+
+    def recording(value: Any) -> Any:
+        return orig(value)
+
+    def fake_resolve(device_type: str) -> Any:
+        seen_types.append(device_type)
+        return recording
+
+    monkeypatch.setattr(kv_wrap, "resolve_kv_wrapper_factory", fake_resolve)
+
+    k, v = torch.zeros(2), torch.zeros(3)
+    planes = (k, v)
+    assert kv_wrap.wrap_one_kv_cache(planes) == "wrapper-1"
+
+    assert seen_types == ["cpu"]
+    # The whole sequence is handed to the device factory as one value.
+    assert factory.wrapped == [(k, v)]
+
+
+def test_wrap_kv_caches_wraps_one_wrapper_per_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _RecordingFactory()
+    monkeypatch.setattr(kv_wrap, "wrap_one_kv_cache", factory)
     k0, v0 = torch.zeros(2), torch.zeros(3)
-    k1, v1 = torch.zeros(4), torch.zeros(5)
-    kv_caches = {
-        "layer.0": (k0, v0),
-        "layer.1": (k1, v1),
-    }
+    single = torch.zeros(4)
 
-    flat = kv_wrap.flatten_kv_cache_values(kv_caches)
+    wrappers = kv_wrap.wrap_kv_caches({"layer.0": (k0, v0), "layer.1": single})
 
-    assert flat == [k0, v0, k1, v1]
+    # One wrapper per registered layer; the tuple is not flattened.
+    assert factory.wrapped == [(k0, v0), single]
+    assert wrappers == ["wrapper-1", "wrapper-2"]
 
 
-def test_flatten_passes_plain_tensors_through() -> None:
-    t0, t1 = torch.zeros(2), torch.zeros(3)
+def test_wrap_kv_caches_releases_partial_wrappers_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unlinked: list[str] = []
 
-    flat = kv_wrap.flatten_kv_cache_values({"a": t0, "b": t1})
+    class _ShmWrapper:
+        shm_name = "seg-1"
 
-    assert flat == [t0, t1]
+    class _FailingFactory:
+        def __init__(self) -> None:
+            self.calls = 0
 
+        def __call__(self, value: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return _ShmWrapper()
+            raise RuntimeError("boom")
 
-def test_planes_per_layer_reads_uniform_tuple_arity() -> None:
-    assert kv_wrap.planes_per_layer({"l": (torch.zeros(1), torch.zeros(1))}) == [2]
-    assert kv_wrap.planes_per_layer(
-        {"l": (torch.zeros(1), torch.zeros(1), torch.zeros(1))}
-    ) == [3]
+    monkeypatch.setattr(kv_wrap, "wrap_one_kv_cache", _FailingFactory())
+    monkeypatch.setattr(
+        kv_wrap,
+        "_release_partial_kv_wrappers",
+        lambda ws: unlinked.extend(getattr(w, "shm_name", None) for w in ws),
+    )
 
+    with pytest.raises(RuntimeError, match="boom"):
+        kv_wrap.wrap_kv_caches({"a": torch.zeros(1), "b": torch.zeros(1)})
 
-def test_planes_per_layer_defaults_for_flat_or_mixed_values() -> None:
-    assert kv_wrap.planes_per_layer({"l": torch.zeros(1)}) == [1]
-    assert kv_wrap.planes_per_layer({}) == []
-    assert kv_wrap.planes_per_layer(
-        {"a": (torch.zeros(1), torch.zeros(1)), "b": torch.zeros(1)}
-    ) == [2, 1]
-    assert kv_wrap.planes_per_layer(
-        {"a": (torch.zeros(1),), "b": (torch.zeros(1), torch.zeros(1))}
-    ) == [1, 2]
+    assert unlinked == ["seg-1"]
 
 
 def test_per_layer_planes_unwraps_arity_one_sequences() -> None:
@@ -83,54 +127,3 @@ def test_per_layer_planes_keeps_plain_tensor_entries() -> None:
     b = torch.zeros(2)
     out = kv_wrap.per_layer_planes({"a": a, "b": (b,)})
     assert out == [a, b]
-
-
-def test_with_planes_per_layer_merges_mixed_arity_list() -> None:
-    hints = {"kv_layout": "NHD"}
-    merged = kv_wrap.with_planes_per_layer(hints, [1, 2, 1])
-    assert merged == {"kv_layout": "NHD", "planes_per_layer": [1, 2, 1]}
-    assert hints == {"kv_layout": "NHD"}
-
-
-def test_wrap_kv_caches_wraps_flattened_tuple_values(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    factory = _RecordingFactory()
-    monkeypatch.setattr(kv_wrap, "wrap_one_kv_cache", factory)
-    k0, v0, k1, v1 = (torch.zeros(i + 1) for i in range(4))
-
-    wrappers = kv_wrap.wrap_kv_caches({"layer.0": (k0, v0), "layer.1": (k1, v1)})
-
-    assert factory.wrapped == [k0, v0, k1, v1]
-    assert wrappers == ["wrapper-1", "wrapper-2", "wrapper-3", "wrapper-4"]
-
-
-def test_with_planes_per_layer_merges_dict_hints() -> None:
-    hints = {"kv_layout": "NHD"}
-
-    merged = kv_wrap.with_planes_per_layer(hints, [2])
-
-    assert merged == {"kv_layout": "NHD", "planes_per_layer": [2]}
-    assert hints == {"kv_layout": "NHD"}  # input untouched
-
-
-def test_with_planes_per_layer_merges_typeddict_hints() -> None:
-    # First Party
-    from lmcache.v1.gpu_connector.utils import LayoutHints
-
-    hints = LayoutHints(kv_layout="NHD")
-
-    merged = kv_wrap.with_planes_per_layer(hints, [3])
-
-    assert merged == {"kv_layout": "NHD", "planes_per_layer": [3]}
-    assert hints == {"kv_layout": "NHD"}  # input untouched
-
-
-def test_with_planes_per_layer_is_noop_when_not_needed() -> None:
-    assert kv_wrap.with_planes_per_layer({"kv_layout": "NHD"}, [1]) == {
-        "kv_layout": "NHD"
-    }
-    kept = {"planes_per_layer": [4]}
-    assert kv_wrap.with_planes_per_layer(kept, [2]) is kept
-    non_dict = object()
-    assert kv_wrap.with_planes_per_layer(non_dict, [2]) is non_dict

@@ -9,8 +9,10 @@ Three groups, all runnable without Ascend hardware:
 - The ``NL_X_TWO_X_NB_BS_HS`` (MLA/DSA plane-tuple) branch of
   ``multi_layer_block_kv_transfer``: byte-exact D2H/H2D roundtrips on CPU
   tensors through the ``DeviceOps`` facade.
-- The ``planes_per_layer`` layout hint: regrouping of a flat plane list
-  into per-layer tuples inside ``normalize_and_discover_per_layer_formats``.
+- Per-layer plane-tuple entries in ``normalize_and_discover_per_layer_formats``
+  (what the plane-aggregating NPU IPC wrapper's ``to_tensor`` yields on the
+  server): tuples of paged planes classify as the MLA/DSA format, bare
+  tensors keep their per-layer formats.
 """
 
 # Standard
@@ -434,9 +436,7 @@ def _expected_mixed_dtype_d2h_chunks(
     """Byte-packed expected chunks for mixed-item-size MLA planes."""
     num_layers = len(planes)
     num_objects = (len(block_ids) + blocks_per_object - 1) // blocks_per_object
-    hidden_bytes = sum(
-        int(p.shape[-1]) * int(p.element_size()) for p in planes[0]
-    )
+    hidden_bytes = sum(int(p.shape[-1]) * int(p.element_size()) for p in planes[0])
     expected = torch.zeros(
         num_objects, num_layers, chunk_tokens, hidden_bytes, dtype=torch.uint8
     )
@@ -596,7 +596,7 @@ def test_block_transfer_pointer_mode_objects_roundtrip_cpu() -> None:
 
 
 # ====================================================================== #
-#  normalize_and_discover_per_layer_formats: planes_per_layer regroup     #
+#  normalize_and_discover_per_layer_formats: per-layer plane entries      #
 # ====================================================================== #
 
 NB, NL, BS, HS = 7, 5, 3, 4
@@ -607,53 +607,48 @@ def _plane(width: int) -> torch.Tensor:
     return torch.zeros((NB, BS, 1, width), dtype=torch.float16)
 
 
-def _flat_planes(widths: tuple[int, ...]) -> list[torch.Tensor]:
-    """A flat per-plane registration list: ``NL`` consecutive plane groups."""
-    flat: list[torch.Tensor] = []
-    for _ in range(NL):
-        flat.extend(_plane(width) for width in widths)
-    return flat
+def test_two_plane_layers_detect_mla_tuple() -> None:
+    """Per-layer (latent, rope) entries classify as the MLA tuple format.
 
-
-def test_regroup_two_planes_detects_mla_tuple() -> None:
-    """A flat 2*NL latent+rope list regroups into the MLA tuple format."""
-    flat = _flat_planes((HS * 8, HS))
+    This is the structure the plane-aggregating ``NpuIPCWrapper.to_tensor``
+    yields on the server: one entry per layer, planes kept in-band.
+    """
+    layers = [(_plane(HS * 8), _plane(HS)) for _ in range(NL)]
     normalized, formats = normalize_and_discover_per_layer_formats(
-        flat,
+        layers,
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
+        {"kv_layout": "NHD"},
     )
     assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
     assert len(normalized) == NL
-    # The regrouped planes must alias the registered buffers, not copy them.
+    # The detected planes must alias the registered buffers, not copy them.
     for layer_idx, layer in enumerate(normalized):
         assert isinstance(layer, (list, tuple))
         assert len(layer) == 2
-        flat_idx = layer_idx * 2
         assert [p.data_ptr() for p in layer] == [
-            flat[flat_idx].data_ptr(),
-            flat[flat_idx + 1].data_ptr(),
+            layers[layer_idx][0].data_ptr(),
+            layers[layer_idx][1].data_ptr(),
         ]
 
 
-def test_regroup_three_planes_detects_dsa_tuple() -> None:
-    """A flat 3*NL latent+rope+dsa list regroups into the same tuple format."""
+def test_three_plane_layers_detect_dsa_tuple() -> None:
+    """Per-layer (latent, rope, dsa) entries keep the same tuple format."""
     normalized, formats = normalize_and_discover_per_layer_formats(
-        _flat_planes((HS * 8, HS, HS * 2)),
+        [(_plane(HS * 8), _plane(HS), _plane(HS * 2)) for _ in range(NL)],
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": [3] * NL},
+        {"kv_layout": "NHD"},
     )
     assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
     assert len(normalized) == NL
     assert all(len(layer) == 3 for layer in normalized)
 
 
-def test_regroup_default_one_keeps_today_classification() -> None:
-    """Without the hint a flat plane list keeps its pre-existing format."""
+def test_bare_tensor_layers_keep_today_classification() -> None:
+    """A flat list of single-plane tensors keeps its pre-existing format."""
     normalized, formats = normalize_and_discover_per_layer_formats(
-        _flat_planes((HS * 8, HS)),
+        [_plane(HS * 8) for _ in range(2 * NL)],
         [],
         EngineType.VLLM,
         {"kv_layout": "NHD"},
@@ -662,42 +657,22 @@ def test_regroup_default_one_keeps_today_classification() -> None:
     assert len(normalized) == 2 * NL
 
 
-def test_regroup_skips_already_grouped_tuples() -> None:
-    """Already-tuple input is left alone even when the hint is present."""
-    tuples = [(_plane(HS * 8), _plane(HS)) for _ in range(NL)]
-    normalized, formats = normalize_and_discover_per_layer_formats(
-        tuples,
-        [],
-        EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
-    )
-    assert formats == [F.NL_X_TWO_X_NB_BS_HS] * NL
-    assert len(normalized) == NL
+def test_mixed_arity_entries_pair_mla_and_keep_bare_swa() -> None:
+    """Bare-tensor and plane-tuple entries detect side by side.
 
-
-def test_regroup_rejects_indivisible_plane_count() -> None:
-    """A flat list whose length is not a multiple of the hint raises."""
-    flat = _flat_planes((HS * 8, HS))[: 2 * NL - 1]
-    with pytest.raises(ValueError, match="planes_per_layer"):
-        normalize_and_discover_per_layer_formats(
-            flat,
-            [],
-            EngineType.VLLM,
-            {"kv_layout": "NHD", "planes_per_layer": [2] * NL},
-        )
-
-
-def test_regroup_mixed_arity_list_pairs_mla_and_unwraps_swa() -> None:
-    """A mixed 1-/2-plane flat list regroups by per-layer arity."""
+    Mirrors a vLLM-Ascend hybrid registration (SWA + MLA + indexer) after
+    per-layer wrapping: each server-side entry is whatever the layer
+    registered, with no out-of-band arity hint.
+    """
     swa0 = _plane(HS * 8)
     lat = _plane(HS * 8)
     scale = _plane(HS)
     swa1 = _plane(HS * 8)
     normalized, formats = normalize_and_discover_per_layer_formats(
-        [swa0, lat, scale, swa1],
+        [swa0, (lat, scale), swa1],
         [],
         EngineType.VLLM,
-        {"kv_layout": "NHD", "planes_per_layer": [1, 2, 1]},
+        {"kv_layout": "NHD"},
     )
     assert len(normalized) == 3
     assert formats[0] == F.NL_X_NB_BS_NH_CS

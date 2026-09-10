@@ -3,9 +3,14 @@
 
 These helpers used to live under ``lmcache.integration.vllm`` for historical
 reasons, but they are engine-neutral: dispatch happens purely via
-:func:`resolve_kv_wrapper_factory` on ``tensor.device.type``. Keeping them
+:func:`resolve_kv_wrapper_factory` on the value's device type. Keeping them
 here lets core transfer contexts (e.g. ``LMCacheDrivenTransferContext``) use
 them without importing the vLLM integration package.
+
+Wrapping is **per layer**: an engine may register a layer as one tensor or
+as a sequence of paged planes, and each registered value becomes exactly one
+IPC wrapper, so the per-layer structure survives the multiprocess wire
+in-band (no out-of-band plane-count hint).
 """
 
 # Future
@@ -27,54 +32,27 @@ logger = init_logger(__name__)
 
 
 def wrap_one_kv_cache(tensor: torch.Tensor) -> Any:
-    """Dispatch by ``tensor.device.type`` via the platform registry.
+    """Dispatch on the value's device type via the platform registry.
 
     Concrete factories are supplied by the registered ``DeviceSpec`` objects,
     so this call site stays free of if/elif chains and external accelerators
     can provide their wrapper from an installed device-plugin wheel.
+
+    The value may also be one layer's paged-plane sequence (e.g.
+    vLLM-Ascend's per-layer ``(K, V)`` tuples): the device is probed by
+    descending into the first tensor, and the whole sequence is handed to
+    the device factory as one value. Whether plane sequences are supported
+    is the device wrapper's decision (the plane-aggregating
+    :class:`~lmcache.v1.platform.npu.ipc_wrapper.NpuIPCWrapper` accepts
+    them; single-tensor wrappers reject them inside their ``__init__``).
     """
-    return resolve_kv_wrapper_factory(tensor.device.type)(tensor)
+    # Local import: the platform layer must not gain a module-level
+    # dependency on the gpu_connector package (its ``__init__`` drags in
+    # the heavy connector modules and would risk an import cycle).
+    # First Party
+    from lmcache.v1.gpu_connector.utils import get_device
 
-
-def flatten_kv_cache_values(
-    kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> list[torch.Tensor]:
-    """Flatten per-layer tensor-or-tuple values into one ordered list.
-
-    Args:
-        kv_caches: Mapping from layer name to the layer's KV tensor or, for
-            engines that hand per-layer plane tuples (e.g. vLLM-Ascend's
-            per-layer (K, V) pairs), the tuple of that layer's planes.
-
-    Returns:
-        Every tensor in layer-then-plane order.
-    """
-    flat: list[torch.Tensor] = []
-    for value in kv_caches.values():
-        if isinstance(value, (tuple, list)):
-            flat.extend(value)
-        else:
-            flat.append(value)
-    return flat
-
-
-def planes_per_layer(
-    kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
-) -> list[int]:
-    """Return the per-layer plane counts of ``kv_caches``.
-
-    Args:
-        kv_caches: Mapping from layer name to tensor or per-layer tuple.
-
-    Returns:
-        One count per dict key in registration order (``1`` for a bare
-        tensor, ``len(tuple)`` for a plane tuple). Empty input yields
-        ``[]``.
-    """
-    counts: list[int] = []
-    for value in kv_caches.values():
-        counts.append(1 if isinstance(value, torch.Tensor) else len(value))
-    return counts
+    return resolve_kv_wrapper_factory(get_device(tensor).type)(tensor)
 
 
 def per_layer_planes(
@@ -102,70 +80,46 @@ def per_layer_planes(
     return canonical
 
 
-def with_planes_per_layer(hints: Any, planes: list[int]) -> Any:
-    """Merge a derived per-layer plane-count list into layout hints.
-
-    Hints are a plain dict / ``LayoutHints`` TypedDict at runtime; engines
-    may pass partial dicts, so the merge keeps every existing key.
-
-    Args:
-        hints: The existing layout hints (dict / LayoutHints).
-        planes: Per-layer plane counts in registration order.
-
-    Returns:
-        A new dict carrying ``planes_per_layer`` when any count is not 1
-        and the hints do not already set it; the input otherwise
-        (including for any non-dict hints object).
-    """
-    if not isinstance(hints, dict):
-        return hints
-    if not planes or all(n == 1 for n in planes):
-        return hints
-    if hints.get("planes_per_layer"):
-        return hints
-    merged = dict(hints)
-    merged["planes_per_layer"] = planes
-    return merged
-
-
 def wrap_kv_caches(
     kv_caches: dict[str, "torch.Tensor | tuple[torch.Tensor, ...]"],
 ) -> KVCache:
-    """Wrap every KV cache tensor for IPC transport.
+    """Wrap every layer's KV cache for IPC transport.
 
     Args:
         kv_caches: Mapping from layer name to the layer's KV tensor or
-            per-layer plane tuple (e.g. vLLM-Ascend's (K, V) pairs); tuple
-            values are flattened in layer-then-plane order, so pair this
-            with ``LayoutHints.planes_per_layer`` so the server regroups
-            the flat wrapper list back into layers.
+            per-layer plane sequence (e.g. vLLM-Ascend's (K, V) pairs).
+            Each value becomes exactly one wrapper, so the per-layer
+            structure survives the wire in-band: one list element per
+            layer, reconstructing to a bare tensor or a plane tuple.
 
     Returns:
-        The list of per-tensor IPC wrappers, ready for the msgspec wire.
+        The list of per-layer IPC wrappers, ready for the msgspec wire.
     """
-    flat = flatten_kv_cache_values(kv_caches)
-    # Emit a per-tensor (shape, dtype) summary so the operator can verify
-    # the exact tensor geometry being shipped to the LMCache server, then
-    # the low-noise count of handles being wrapped.
-    kept_summary = [(tuple(tensor.shape), str(tensor.dtype)) for tensor in flat]
+    values = list(kv_caches.values())
+    # Emit a per-layer shape/dtype structure summary (shared walker, see
+    # get_shape_and_dtype) so the operator can verify the exact tensor
+    # geometry being shipped to the LMCache server, then the low-noise
+    # count of handles being wrapped.
+    # First Party
+    from lmcache.v1.gpu_connector.utils import get_shape_and_dtype
+
+    # Plane sequences flow unannotated by design (see wrap_one_kv_cache).
+    structures = get_shape_and_dtype(values)  # type: ignore[arg-type]
     logger.debug(
-        "KV cache transfer keeping %d tensor(s) (shape, dtype):\n%s",
-        len(kept_summary),
-        "\n".join(
-            f"  [{i}]  shape={shape}  dtype={dtype}"
-            for i, (shape, dtype) in enumerate(kept_summary)
-        ),
+        "KV cache transfer keeping %d layer(s) (shape, dtype):\n%s",
+        len(structures),
+        "\n".join(f"  [{i}]  {s}" for i, s in enumerate(structures)),
     )
-    logger.info("Wrapping %d KV cache tensors for IPC", len(flat))
-    # Per-iteration resource management: if wrapping the N-th tensor
+    logger.info("Wrapping %d KV cache layers for IPC", len(values))
+    # Per-iteration resource management: if wrapping the N-th layer
     # raises, ``shm_unlink`` whatever earlier iterations already
     # registered with POSIX SHM so the named segments do not outlive
-    # the failed batch. CUDA wrappers do not own a named segment and
-    # are skipped via the duck-typed ``shm_name`` check.
+    # the failed batch. CUDA/NPU wrappers do not own a named segment
+    # and are skipped via the duck-typed ``shm_name`` check.
     wrappers: KVCache = []
     try:
-        for tensor in flat:
-            wrappers.append(wrap_one_kv_cache(tensor))
+        for value in values:
+            wrappers.append(wrap_one_kv_cache(value))  # type: ignore[arg-type]
     except BaseException:
         _release_partial_kv_wrappers(wrappers)
         raise
@@ -177,7 +131,7 @@ def _release_partial_kv_wrappers(wrappers: list[Any]) -> None:
 
     Used by :func:`wrap_kv_caches` to roll back a half-finished batch
     when a later iteration raises. Only POSIX-SHM-backed wrappers carry
-    a ``shm_name`` attribute, so other wrapper kinds (e.g. CUDA-IPC)
+    a ``shm_name`` attribute, so other wrapper kinds (e.g. CUDA/NPU IPC)
     are silently skipped.
     """
     # First Party
