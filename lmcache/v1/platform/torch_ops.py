@@ -969,7 +969,7 @@ def _normalize_paged_layers(
         - ``list[(torch.Tensor, torch.Tensor)]`` (NL ``(K, V)`` pairs) for the
           per-layer tuple format (``NL_X_TWO_X_NB_BS_NH_HS``).
         - ``list[tuple[torch.Tensor, ...]]`` (NL plane tuples of 2 MLA or 3
-          DSA ``[NB, BS, 1, W]`` tensors) for ``NL_X_TWO_X_NB_BS_HS``.
+          DSA ``[NB, BS, 1, W]`` tensors) for ``NL_X_NP_X_NB_BS_ONE_HS``.
         - ``list[torch.Tensor]`` (per-layer) for all other formats.
     """
     if is_cross_layer(engine_kv_format):
@@ -1053,10 +1053,10 @@ def _normalize_paged_layers(
             "got: " + type(paged_buffer_ptrs_tensor).__name__
         )
     if _is_kv_second_tuple_format(engine_kv_format):
-        # NL_X_TWO_X_NB_BS_HS carries MLA (latent, rope) or DSA
+        # NL_X_NP_X_NB_BS_ONE_HS carries MLA (latent, rope) or DSA
         # (latent, rope, dsa) plane tuples of any length >= 2; every other
         # tuple format is an exact (K, V) pair.
-        is_mla_plane_tuple = engine_kv_format == EngineKVFormat.NL_X_TWO_X_NB_BS_HS
+        is_mla_plane_tuple = engine_kv_format == EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
         if isinstance(paged_buffer_ptrs_tensor, list) and all(
             isinstance(t, (list, tuple))
             and (len(t) >= 2 if is_mla_plane_tuple else len(t) == 2)
@@ -1280,7 +1280,7 @@ def multi_layer_block_kv_transfer(
             is_d2h,
             skip_prefix_n_blocks,
         )
-    elif engine_kv_format == EngineKVFormat.NL_X_TWO_X_NB_BS_HS:
+    elif engine_kv_format == EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS:
         # Must precede the generic MLA branch: is_mla() is also true for the
         # plane-tuple format, whose per-layer entries are tuples, not tensors.
         # The tuple-branch validation above established that ``normalized``

@@ -176,11 +176,11 @@ def test_extract_kv_cache_shapes_mixed_nested():
 def test_vllm_mla_tuple_unequal_widths():
     # vLLM-Ascend MLA: per-layer (latent, rope) planes, single latent head,
     # mutually unequal widths -> the flat summed-width MLA tuple format.
-    if not hasattr(F, "NL_X_TWO_X_NB_BS_HS"):
-        pytest.skip("extension lacks NL_X_TWO_X_NB_BS_HS")
+    if not hasattr(F, "NL_X_NP_X_NB_BS_ONE_HS"):
+        pytest.skip("extension lacks NL_X_NP_X_NB_BS_ONE_HS")
     kv = [(_t(NB, BS, 1, HS * 8), _t(NB, BS, 1, HS)) for _ in range(NL)]
     fmt, out = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
-    assert fmt == F.NL_X_TWO_X_NB_BS_HS
+    assert fmt == F.NL_X_NP_X_NB_BS_ONE_HS
     # Contiguous-view recovery may normalize tuples to lists; storage must be
     # shared with the input planes.
     assert [p.data_ptr() for p in out[0]] == [p.data_ptr() for p in kv[0]]
@@ -188,14 +188,14 @@ def test_vllm_mla_tuple_unequal_widths():
 
 def test_vllm_dsa_tuple_three_planes():
     # vLLM-Ascend DSA: per-layer (latent, rope, dsa) 3-tuples.
-    if not hasattr(F, "NL_X_TWO_X_NB_BS_HS"):
-        pytest.skip("extension lacks NL_X_TWO_X_NB_BS_HS")
+    if not hasattr(F, "NL_X_NP_X_NB_BS_ONE_HS"):
+        pytest.skip("extension lacks NL_X_NP_X_NB_BS_ONE_HS")
     kv = [
         (_t(NB, BS, 1, HS * 8), _t(NB, BS, 1, HS), _t(NB, BS, 1, HS * 2))
         for _ in range(NL)
     ]
     fmt, _ = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
-    assert fmt == F.NL_X_TWO_X_NB_BS_HS
+    assert fmt == F.NL_X_NP_X_NB_BS_ONE_HS
 
 
 def test_vllm_tuple_equal_widths_stays_kv_pair():

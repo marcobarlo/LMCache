@@ -2539,10 +2539,10 @@ def scenario_multi_layer_block_kv_transfer(
                     paged_tuple[i][kv], paged_tuple_h2d[i][kv], atol=1e-6
                 ), f"Per-layer (K,V) tuple Layer {i} kv={kv} round-trip mismatch"
 
-        # --- vLLM-Ascend MLA/DSA plane tuples (NL_X_TWO_X_NB_BS_HS) ---
+        # --- vLLM-Ascend MLA/DSA plane tuples (NL_X_NP_X_NB_BS_ONE_HS) ---
         # Concatenated last-axis slabs into rank-3 [L, tokens, sum(W)].
         # Same Python-fallback-only constraint as (K, V) tuples above.
-        engine_mla_tuple = ops.EngineKVFormat.NL_X_TWO_X_NB_BS_HS
+        engine_mla_tuple = ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
         for widths in ((6, 2), (6, 2, 4)):
             width_sum = sum(widths)
             paged_mla = [

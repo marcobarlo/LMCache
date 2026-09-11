@@ -12,7 +12,7 @@ external `lmcache_ascend` plugin and are layered on by `NpuDeviceOps` via
 |---|---|
 | `event_ipc.py` | `NpuEventIPCBackend` — torch_npu implements the CUDA-style interprocess event ABI (`interprocess=True`, `ipc_handle`, `from_ipc_handle`), so the shared `DefaultEventIPCBackend` adapter applies, with two NPU overrides: `export_event` serializes with `device` pinned as the thread's current device (CANN, unlike CUDA, derives the handle from the current device at export time — callers on multi-device threads cannot rely on their ambient device) and keeps the source event alive in a bounded cache (CANN invalidates a handle once its source event is destroyed). `check_event_support` fails closed on builds lacking the ABI. |
 | `ipc_wrapper.py` | `NpuIPCWrapper` — plane-aggregating KV IPC wrapper bound on `NpuDeviceSpec.ipc_wrapper_cls` (moved upstream from the plugin). One wrapper per registered layer; `to_tensor()` yields a bare tensor or a plane tuple, so per-layer structure crosses the wire in-band. See `ipc_wrapper.md`. |
-| `cache_context.py` | `NpuCacheContext` (subclass of `BaseCacheContext`) — imports worker KV mappings from `NpuIPCWrapper` and owns `_TempNpuBuffer` staging and the transfer stream. `get_kernel_group_kv_pointers` returns per-layer plane **views** — the zero-copy IPC-imported tensors themselves, or tuples of plane tensors for `NL_X_TWO_X_NB_BS_HS` — not a device-resident pointer table: per-plane widths are unrecoverable from the summed `shape_desc.hs`, and the torch fallback consumes per-layer structures directly. The Phase-2 native fast path must revisit this method if it needs a real pointer table. `_NpuHostCallbackStream` adapts the torch_npu stream to the `cupy_stream` contract (`.ptr` from `npu_stream`; `launch_host_func` degrades to synchronize-then-run). |
+| `cache_context.py` | `NpuCacheContext` (subclass of `BaseCacheContext`) — imports worker KV mappings from `NpuIPCWrapper` and owns `_TempNpuBuffer` staging and the transfer stream. `get_kernel_group_kv_pointers` returns per-layer plane **views** — the zero-copy IPC-imported tensors themselves, or tuples of plane tensors for `NL_X_NP_X_NB_BS_ONE_HS` — not a device-resident pointer table: per-plane widths are unrecoverable from the summed `shape_desc.hs`, and the torch fallback consumes per-layer structures directly. The Phase-2 native fast path must revisit this method if it needs a real pointer table. `_NpuHostCallbackStream` adapts the torch_npu stream to the `cupy_stream` contract (`.ptr` from `npu_stream`; `launch_host_func` degrades to synchronize-then-run). |
 | `device_ops.py` | `NpuDeviceOps` binds `lmcache_ascend.c_ops` and keeps completion/event recording stream-ordered: `_synchronize_npu_stream_pointer` (via `acl.rt.synchronize_stream`) runs before the immediate-enqueue fallback, preserving the `finish_write` storage-ownership contract until the plugin ships a native `aclrtLaunchCallback` recorder. |
 
 ## Shared-code additions (B-lite)
@@ -21,7 +21,7 @@ Three touches outside `lmcache/v1/platform/npu/` are sanctioned for this
 path; all other NPU-specific code lives in the plugin or under `npu/`:
 
 - `torch_ops._tensor_from_npu_ptr` (plus its `npu` dispatch arm in
-  `_tensor_from_ptr`) and the `NL_X_TWO_X_NB_BS_HS` branch of the
+  `_tensor_from_ptr`) and the `NL_X_NP_X_NB_BS_ONE_HS` branch of the
   `multi_layer_block_kv_transfer` fallback
   (`_transfer_per_layer_mla_tuple`) let the torch fallback reconstruct NPU
   tensors from raw pointers and transfer per-layer plane tuples.
@@ -39,7 +39,7 @@ path; all other NPU-specific code lives in the plugin or under `npu/`:
 `_TempNpuBuffer` allocates one flat `uint8` buffer per
 `max_batch_size` chunks with two offset maps — `(batch, kernel_group)` and
 `(batch, object_group)`. Per-layer MLA-family formats
-(`NL_X_NB_BS_HS`, `NL_X_TWO_X_NB_BS_HS`) stage as rank-3
+(`NL_X_NB_BS_HS`, `NL_X_NP_X_NB_BS_ONE_HS`) stage as rank-3
 `[L, slots, W]`; other formats use the rank-4
 `(kv_size, L, slots, W)` layout. Kernel-group buffers are contiguous inside
 their object group (the staging memcpy contract).

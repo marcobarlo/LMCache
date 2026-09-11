@@ -198,7 +198,7 @@ class _TempNpuBuffer:
         )
         if group.engine_kv_format in (
             EngineKVFormat.NL_X_NB_BS_HS,
-            EngineKVFormat.NL_X_TWO_X_NB_BS_HS,
+            EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
         ):
             return torch.Size((group.num_layers, num_slots, group.hidden_dim_size))
         sd = group.shape_desc

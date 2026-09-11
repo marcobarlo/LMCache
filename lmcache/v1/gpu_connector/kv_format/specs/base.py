@@ -31,6 +31,11 @@ import lmcache.lmcache_native as lmcache_native
 _LABELS = {
     "ONE": "1",
     "TWO": "2",
+    # Plane count of an MLA/DSA layer tuple: 2 (latent, rope) or 3
+    # (latent, rope, dsa) depending on the model family, so it stays a
+    # symbol -- even concrete shapes cannot pin it from a shape_desc
+    # (which carries only the summed ``hs``).
+    "NP": "NP",
     "NBBS": "PBS",
     "NB": "NB",
     "NL": "NL",
@@ -83,9 +88,15 @@ def concrete_shape(
 
     E.g. ``NL_X_TWO_NB_BS_NH_HS`` with ``NL=32, NB=2048, BS=16, NH=8, HS=128``
     -> ``32 x [2, 2048, 16, 8, 128]``.
+
+    ``NP`` stays symbolic like ``ONE``/``TWO``: the plane count varies by
+    model family (2 MLA / 3 DSA) and is not a ``shape_desc`` field.
     """
     return _render_shape(
-        fmt, lambda t: _LABELS[t] if t in ("ONE", "TWO") else str(size(_LABELS[t]))
+        fmt,
+        lambda t: _LABELS[t]
+        if t in ("ONE", "TWO", "NP")
+        else str(size(_LABELS[t])),
     )
 
 

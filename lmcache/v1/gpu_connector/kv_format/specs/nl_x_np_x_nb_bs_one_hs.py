@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-layer MLA/DSA tuple format: ``NL x [planes x [NB, BS, 1, HS]]``.
+"""Per-layer MLA/DSA tuple format: ``NL x NP x [NB, BS, 1, HS]`` (NP planes).
 
-Each layer's KV cache is stored as a tuple of 2 (MLA: ``latent, rope``) or
-3 (DSA: ``latent, rope, dsa``) paged tensors
+Each layer's KV cache is stored as a tuple of NP == 2 (MLA: ``latent, rope``)
+or NP == 3 (DSA: ``latent, rope, dsa``) paged tensors
 ``[num_blocks, block_size, 1, width]``, produced by vLLM-Ascend for
 DeepSeek-V2/V3 MLA and V3.2 DSA models. All planes share a single latent
 KV head and their widths are mutually unequal, which is what distinguishes
@@ -29,8 +29,8 @@ from lmcache.v1.gpu_connector.kv_format.specs.base import KVFormatSpec
 import lmcache.lmcache_native as lmcache_native
 
 
-class NL_X_TWO_X_NB_BS_HS_Spec(KVFormatSpec):
-    engine_kv_format = lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS
+class NL_X_NP_X_NB_BS_ONE_HS_Spec(KVFormatSpec):
+    engine_kv_format = lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
     attention_backends = (
         "vLLM-Ascend MLA (latent, rope) tuples",
         "vLLM-Ascend DSA (latent, rope, dsa) tuples",
@@ -68,7 +68,7 @@ class NL_X_TWO_X_NB_BS_HS_Spec(KVFormatSpec):
         itemsize = int(self.dtype(layer_idx).itemsize)
         if itemsize <= 0 or total_bytes % itemsize != 0:
             raise ValueError(
-                "NL_X_TWO_X_NB_BS_HS hidden_dim: plane byte total "
+                "NL_X_NP_X_NB_BS_ONE_HS hidden_dim: plane byte total "
                 f"{total_bytes} is not a multiple of dtype itemsize {itemsize}"
             )
         return total_bytes // itemsize

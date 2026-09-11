@@ -109,7 +109,7 @@ class VLLM_Detector(EngineDetector):
                 widths = {int(t.shape[-1]) for t in planes0}
                 if single_head and (len(planes0) == 3 or len(widths) > 1):
                     return (
-                        lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS,
+                        lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
                         kv_caches,
                     )
                 if len(planes0) == 2:

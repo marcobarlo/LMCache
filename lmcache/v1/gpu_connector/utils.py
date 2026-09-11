@@ -529,7 +529,7 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # compressor / indexer caches sharing a KV pool with larger attn
 # groups).
 #
-# ``NL_X_TWO_X_NB_BS_HS`` (vLLM-Ascend w8a8 MLA latent+scale tuples)
+# ``NL_X_NP_X_NB_BS_ONE_HS`` (vLLM-Ascend w8a8 MLA latent+scale tuples)
 # is included because measured DSv4 planes share one per-block *byte*
 # step (latent: 16640 int8 elems; scale: 8320 float16 elems). A
 # sibling-plane check in :func:`resolve_block_stride_and_log_layout`
@@ -550,7 +550,7 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
     {
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
-        lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS,
+        lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
         # Under vLLM's blocks-first layouts (BLHNC / BLNHC) these views'
         # stride(0) spans every layer's bytes for the block; when the cache
         # is layer-compact, stride(0) is simply the tight per-block step.

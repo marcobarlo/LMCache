@@ -40,7 +40,7 @@ CHUNK = 256
 DT = torch.float32
 F = lmcache_native.EngineKVFormat
 
-_RANK3 = (F.NL_X_NB_BS_HS, F.NL_X_TWO_X_NB_BS_HS)
+_RANK3 = (F.NL_X_NB_BS_HS, F.NL_X_NP_X_NB_BS_ONE_HS)
 
 
 def _packed_planes(widths: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
@@ -60,9 +60,9 @@ def _caches(kind: str) -> tuple[list[Any], Any]:
     if kind == "mla":
         return [torch.zeros(NB, BS, W, dtype=DT) for _ in range(NL)], F.NL_X_NB_BS_HS
     if kind == "mla_tuple":
-        return [_packed_planes((8, 2)) for _ in range(NL)], F.NL_X_TWO_X_NB_BS_HS
+        return [_packed_planes((8, 2)) for _ in range(NL)], F.NL_X_NP_X_NB_BS_ONE_HS
     if kind == "dsa_tuple":
-        return [_packed_planes((8, 2, 4)) for _ in range(NL)], F.NL_X_TWO_X_NB_BS_HS
+        return [_packed_planes((8, 2, 4)) for _ in range(NL)], F.NL_X_NP_X_NB_BS_ONE_HS
     if kind == "fused":
         return [
             torch.zeros(NB, BS, NH, 2 * HS, dtype=DT) for _ in range(NL)
