@@ -289,6 +289,7 @@ def normalize_and_discover_per_layer_formats(
         structure and one format per layer (length equals the layer count),
         ready for :func:`lmcache.v1.kv_layer_groups.group_layers_by_identity`.
     """
+
     # Detect the whole structure once. A format that isn't a per-layer list (a
     # cross-layer tensor, or a K/V-split) is single-format -- return it whole.
     extracted_shapes = extract_kv_cache_shapes(kv_caches)
@@ -533,7 +534,7 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # is included because measured DSv4 planes share one per-block *byte*
 # step (latent: 16640 int8 elems; scale: 8320 float16 elems). A
 # sibling-plane check in :func:`resolve_block_stride_and_log_layout`
-# rejects tuples whose dim-0 byte strides disagree.
+# rejects tuples whose per-block byte strides disagree.
 #
 # ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
 # axis on dim-0, but no real serving engine emits a padded layout of
@@ -560,8 +561,12 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
 )
 
 
-def _dim0_byte_stride(tensor: torch.Tensor) -> int:
-    """Physical dim-0 step in bytes (stride(0) * element size)."""
+def _block_byte_stride(tensor: torch.Tensor) -> int:
+    """Bytes stepped along the paged block axis (``stride(0) * element_size``).
+
+    For vLLM-Ascend paged KV, dim 0 is ``NB``; this is the per-block pool
+    slot size in bytes, not the last-axis plane width.
+    """
     return int(tensor.stride(0)) * int(tensor.element_size())
 
 
@@ -570,22 +575,22 @@ def _assert_tuple_planes_share_block_byte_stride(
     probe: torch.Tensor,
     engine_kv_format: "lmcache_native.EngineKVFormat",
 ) -> None:
-    """Reject multi-plane layers whose dim-0 byte strides disagree.
+    """Reject multi-plane layers whose per-block byte strides disagree.
 
     ``PageBufferShapeDesc.block_stride_elems`` is one int per kernel
     group. Independently-strided planes cannot share it; fail closed.
     """
     if not isinstance(planes, (list, tuple)):
         return
-    expected = _dim0_byte_stride(probe)
+    expected = _block_byte_stride(probe)
     for i, plane in enumerate(planes):
         if not isinstance(plane, torch.Tensor):
             continue
-        got = _dim0_byte_stride(plane)
+        got = _block_byte_stride(plane)
         if got != expected:
             raise ValueError(
                 "resolve_block_stride_and_log_layout: plane "
-                f"{i} dim-0 byte stride {got} != probe {expected} for "
+                f"{i} block byte stride {got} != probe {expected} for "
                 f"{engine_kv_format!r}; a single block_stride_elems "
                 "cannot describe independently-strided planes."
             )
