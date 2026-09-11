@@ -43,8 +43,8 @@ class DeviceIPCWrapper:
     **Multi-plane exception.** A wrapper may aggregate the planes of one
     engine layer instead of a single tensor (engines such as vLLM-Ascend
     register per-layer ``(K, V)`` / ``(latent, rope)`` plane sequences, and
-    the wire carries one wrapper per layer so the structure survives
-    in-band). Such a wrapper does not populate the singular interface
+    the wire carries one wrapper per layer). Such a wrapper does not populate
+    the singular interface
     fields -- it keeps one record per plane privately -- and its
     ``to_tensor`` returns the bare tensor for a single-plane value or a
     tuple of tensors otherwise.

@@ -9,8 +9,8 @@ them without importing the vLLM integration package.
 
 Wrapping is **per layer**: an engine may register a layer as one tensor or
 as a sequence of paged planes, and each registered value becomes exactly one
-IPC wrapper, so the per-layer structure survives the multiprocess wire
-in-band (no out-of-band plane-count hint).
+IPC wrapper. On the receiving side ``to_tensor()`` reconstructs that same
+value (a bare tensor or a plane tuple).
 """
 
 # Future
@@ -88,8 +88,7 @@ def wrap_kv_caches(
     Args:
         kv_caches: Mapping from layer name to the layer's KV tensor or
             per-layer plane sequence (e.g. vLLM-Ascend's (K, V) pairs).
-            Each value becomes exactly one wrapper, so the per-layer
-            structure survives the wire in-band: one list element per
+            Each value becomes exactly one wrapper: one list element per
             layer, reconstructing to a bare tensor or a plane tuple.
 
     Returns:

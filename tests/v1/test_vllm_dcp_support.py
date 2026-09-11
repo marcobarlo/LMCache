@@ -275,10 +275,10 @@ class MLAAttentionSpec(AttentionSpec):
 
 
 @dataclass
-class AscendMLAAttentionSpec(AttentionSpec):
-    """Ascend MLA double: block_size is physical slots."""
+class PhysicalSlotAttentionSpec(AttentionSpec):
+    """Spec whose ``block_size`` is physical slots; token span is separate."""
 
-    compress_ratio: int = 1
+    logical_block_size: int
 
 
 @dataclass
@@ -644,22 +644,11 @@ def test_upstream_compress_ratio_does_not_scale_block_size() -> None:
     assert get_tokens_per_block(spec, 2) == 64
 
 
-def test_ascend_compress_ratio_scales_physical_block_size() -> None:
-    """Ascend MLA uses physical slots in block_size plus compress_ratio."""
-    spec = AscendMLAAttentionSpec(block_size=32, compress_ratio=128)
+def test_logical_block_size_overrides_physical_block_size() -> None:
+    """Engines whose pages are physical slots expose token span separately."""
+    spec = PhysicalSlotAttentionSpec(block_size=32, logical_block_size=4096)
     assert get_tokens_per_block(spec, 1) == 4096
     assert get_tokens_per_block(spec, 2) == 8192
-
-
-def test_uniform_type_wrapper_of_ascend_mla_scales() -> None:
-    wrapped = UniformTypeKVCacheSpecs(
-        block_size=32,
-        kv_cache_specs={
-            "l0": AscendMLAAttentionSpec(block_size=32, compress_ratio=128),
-            "l1": AscendMLAAttentionSpec(block_size=32, compress_ratio=128),
-        },
-    )
-    assert get_tokens_per_block(wrapped, 1) == 4096
 
 
 @pytest.mark.parametrize(

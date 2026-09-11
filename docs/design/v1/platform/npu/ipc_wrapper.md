@@ -31,9 +31,8 @@ one `PlaneRecord` `(handle, dtype, shape, stride, storage_offset)` per plane
 inside it. On the wire (`KVCache = list[DeviceIPCWrapper]`) the list element
 count therefore equals the **layer** count, and `to_tensor()` reconstructs a
 bare tensor for single-plane values or a tuple of planes otherwise. The
-per-layer structure survives the wire **in-band** — the server-side
-`normalize_and_discover_per_layer_formats` sees per-layer entries directly
-and needs no out-of-band `planes_per_layer` hint.
+server-side `normalize_and_discover_per_layer_formats` therefore sees the
+same per-layer tensor-or-tuple entries the engine registered.
 
 This exercises the documented **multi-plane exception** of
 `DeviceIPCWrapper` (see its class docstring): the singular interface fields
@@ -41,17 +40,10 @@ are not populated; equality compares `_plane_records` instead. `NpuIPCWrapper`
 is currently the only implementation of the exception; generic code must not
 assume `to_tensor()` returns a bare tensor without checking the device.
 
-## What replaced the hint machinery
-
-| Removed (flatten + hint design) | Replaced by |
-|---|---|
-| `kv_wrap.flatten_kv_cache_values` / `planes_per_layer` / `with_planes_per_layer` | per-layer wrapping in `wrap_kv_caches` (one value → one wrapper) |
-| `LayoutHints.planes_per_layer` + `_regroup_planes_per_layer` server-side regroup | in-band structure from `to_tensor()` |
-| adapter-side hint derivation (`vllm_multi_process_adapter`) | nothing — no hint to derive |
-
-`kv_wrap.per_layer_planes` **stays**: the worker-side metadata path
-(`create_engine_group_infos_from_vllm`) consumes the engine dict directly
-and never crosses the wire, so it still needs the dict-value normalization.
+Worker-side format discovery (`create_engine_group_infos_from_vllm`) never
+crosses the wire. It canonicalizes the engine dict with
+`kv_wrap.per_layer_planes`: arity-1 sequences unwrap to a bare tensor;
+larger sequences become tuples.
 
 ## Dispatch
 

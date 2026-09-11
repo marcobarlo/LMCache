@@ -18,9 +18,8 @@ tensor or as a sequence of paged planes (vLLM-Ascend hands per-layer
 ``(K, V)`` pairs and MLA/DSA ``(latent, rope[, dsa][, scale])`` tuples).
 ``wrap`` accepts either and :meth:`to_tensor` reconstructs the same shape --
 a bare tensor for single-plane values, a tuple for multi-plane ones -- so
-the per-layer structure survives the multiprocess wire in-band and the
-server-side format detection sees it directly, with no out-of-band
-regrouping hint.
+server-side format detection sees the registered per-layer structure
+directly.
 """
 
 # Future

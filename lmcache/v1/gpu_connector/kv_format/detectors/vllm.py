@@ -100,19 +100,19 @@ class VLLM_Detector(EngineDetector):
                 return lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS, kv_caches
             return lmcache_native.EngineKVFormat.NL_X_NB_BS_HS, kv_caches
         if list_depth == 2 and tensor_ndim == 4:
-            planes0 = kv_caches[0]
-            if isinstance(planes0, (tuple, list)):
+            layer0_planes = kv_caches[0]
+            if isinstance(layer0_planes, (tuple, list)):
                 # MLA / DSA tuples: every plane has a single latent KV head
                 # and the plane widths are mutually unequal (a DSA cache is
                 # always a 3-tuple). Equal-width pairs stay generic (K, V).
-                single_head = all(int(t.shape[2]) == 1 for t in planes0)
-                widths = {int(t.shape[-1]) for t in planes0}
-                if single_head and (len(planes0) == 3 or len(widths) > 1):
+                single_head = all(int(t.shape[2]) == 1 for t in layer0_planes)
+                widths = {int(t.shape[-1]) for t in layer0_planes}
+                if single_head and (len(layer0_planes) == 3 or len(widths) > 1):
                     return (
                         lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
                         kv_caches,
                     )
-                if len(planes0) == 2:
+                if len(layer0_planes) == 2:
                     return (
                         lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS,
                         kv_caches,
