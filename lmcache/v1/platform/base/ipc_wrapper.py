@@ -40,19 +40,6 @@ class DeviceIPCWrapper:
     Subclasses implement ``__init__`` (populate the interface fields from a
     tensor) and ``to_tensor`` (reconstruct the tensor from the handle).
 
-    **Multi-plane exception.** A wrapper may aggregate the planes of one
-    engine layer instead of a single tensor (engines such as vLLM-Ascend
-    register per-layer ``(K, V)`` / ``(latent, rope)`` plane sequences, and
-    the wire carries one wrapper per layer). Such a wrapper does not populate
-    the singular interface
-    fields -- it keeps one record per plane privately -- and its
-    ``to_tensor`` restores the registered form (bare tensor or tuple of
-    tensors).
-    :class:`~lmcache.v1.platform.npu.ipc_wrapper.NpuIPCWrapper` is
-    currently the only implementation; generic code must therefore not
-    assume ``to_tensor()`` yields a bare tensor without checking the
-    device.
-
     The default wrapper for each device is bound to that device's
     :class:`~lmcache.v1.platform.base.device_spec.DeviceSpec` via
     :attr:`~lmcache.v1.platform.base.device_spec.DeviceSpec.ipc_wrapper_cls`;
@@ -121,10 +108,6 @@ class DeviceIPCWrapper:
         """Reconstruct the tensor in this process from the IPC handle.
 
         Subclasses implement the transport-specific reconstruction.
-
-        Multi-plane aggregate wrappers (see the class docstring's
-        multi-plane exception) return the bare tensor or a tuple of the
-        layer's plane tensors instead.
         """
         raise NotImplementedError
 

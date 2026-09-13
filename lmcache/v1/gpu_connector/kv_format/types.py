@@ -19,9 +19,7 @@ import torch
 # nested ``DiscoverableKVCache`` values (per-layer lists, SGLang's
 # two-list MHA, deeper nesting). Engine adapters that hand us other
 # containers (e.g. vLLM's ``dict[str, torch.Tensor]``) are responsible
-# for unwrapping to this form before calling the helpers. Tuple nesting
-# (vLLM-Ascend's per-layer plane tuples) is handled at runtime by the
-# ``isinstance`` descent helpers but intentionally not modelled here.
+# for unwrapping to this form before calling the helpers.
 DiscoverableKVCache = Union[torch.Tensor, list["DiscoverableKVCache"]]
 
 KVLayoutName = Literal["NHD", "HND", "BLHNC", "BLNHC"]
