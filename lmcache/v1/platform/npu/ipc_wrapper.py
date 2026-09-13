@@ -16,10 +16,9 @@ instead of riding the CUDA wrapper:
 The wrapper is **plane-aggregating**: engines may register a layer as one
 tensor or as a sequence of paged planes (vLLM-Ascend hands per-layer
 ``(K, V)`` pairs and MLA/DSA ``(latent, rope[, dsa][, scale])`` tuples).
-``wrap`` accepts either and :meth:`to_tensor` reconstructs the same shape --
-a bare tensor for single-plane values, a tuple for multi-plane ones -- so
-server-side format detection sees the registered per-layer structure
-directly.
+``wrap`` accepts either and :meth:`to_tensor` reconstructs the same value
+-- bare tensor or tuple of planes -- so server-side format detection sees
+the registered per-layer structure directly.
 """
 
 # Future
@@ -62,9 +61,8 @@ class NpuIPCWrapper(DeviceIPCWrapper):
     :class:`DeviceIPCWrapper`: it does not populate the base-class
     singular fields (``handle`` / ``dtype`` / ``shape`` / ``stride`` /
     ``storage_offset``) but keeps one :data:`PlaneRecord` per plane in
-    ``_plane_records`` instead, and :meth:`to_tensor` returns a tuple of
-    tensors for multi-plane values. Only the NPU wrapper implements the
-    exception today.
+    ``_plane_records`` plus the registered form in ``_bare``. Only the NPU
+    wrapper implements the exception today.
     """
 
     #: ``torch.device.type`` this wrapper handles; also read by the
@@ -73,6 +71,10 @@ class NpuIPCWrapper(DeviceIPCWrapper):
 
     #: Per-plane ``(handle, dtype, shape, stride, storage_offset)`` records.
     _plane_records: tuple[PlaneRecord, ...]
+
+    #: Whether the registered value was a bare tensor; ``to_tensor``
+    #: restores the same form.
+    _bare: bool
 
     @classmethod
     def wrap(cls, value: "torch.Tensor | Sequence[torch.Tensor]") -> "NpuIPCWrapper":
@@ -107,6 +109,7 @@ class NpuIPCWrapper(DeviceIPCWrapper):
             raise ValueError(
                 "NpuIPCWrapper requires at least one plane, got an empty sequence."
             )
+        self._bare = isinstance(value, torch.Tensor)
         records: list[PlaneRecord] = []
         for plane in planes:
             storage = plane.untyped_storage()
@@ -136,8 +139,8 @@ class NpuIPCWrapper(DeviceIPCWrapper):
             called (guarded by ``torch_dev.init()`` at the call sites).
 
         Returns:
-            The bare tensor for a single-plane wrapper, otherwise the
-            tuple of the layer's plane tensors in registration order.
+            The bare tensor, or the tuple of the layer's plane tensors in
+            registration order (a 1-element sequence stays a 1-tuple).
         """
         device_index = self._get_device_index_from_uuid(self.device_uuid)
         tensors: list[torch.Tensor] = []
@@ -148,7 +151,9 @@ class NpuIPCWrapper(DeviceIPCWrapper):
             t = torch.empty((), device=device_index, dtype=dtype)
             t.set_(storage, storage_offset, shape, stride)
             tensors.append(t)
-        return tensors[0] if len(tensors) == 1 else tuple(tensors)
+        if self._bare:
+            return tensors[0]
+        return tuple(tensors)
 
     def __eq__(self, other: object) -> bool:
         # Base-class equality compares the singular interface fields this
@@ -157,11 +162,12 @@ class NpuIPCWrapper(DeviceIPCWrapper):
             return False
         return (
             self._plane_records == other._plane_records
+            and self._bare == other._bare
             and self.device_uuid == other.device_uuid
         )
 
     def __hash__(self) -> int:
-        return hash((self._plane_records, self.device_uuid))
+        return hash((self._plane_records, self._bare, self.device_uuid))
 
     @staticmethod
     def _get_device_uuid(device_index: int) -> str:

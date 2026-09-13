@@ -2542,8 +2542,9 @@ def scenario_multi_layer_block_kv_transfer(
         # --- vLLM-Ascend MLA/DSA plane tuples (NL_X_NP_X_NB_BS_ONE_HS) ---
         # Concatenated last-axis slabs into rank-3 [L, tokens, sum(W)].
         # Same Python-fallback-only constraint as (K, V) tuples above.
+        # (6,) is the NP=1 degenerate case.
         engine_mla_tuple = ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
-        for widths in ((6, 2), (6, 2, 4)):
+        for widths in ((6,), (6, 2), (6, 2, 4)):
             width_sum = sum(widths)
             paged_mla = [
                 tuple(
@@ -2562,9 +2563,7 @@ def scenario_multi_layer_block_kv_transfer(
             shape_mla.kv_size = 1
             shape_mla.dtype = dtype
             d2h_mla = _alloc_chunks((num_layers, chunk_tokens, width_sum), num_chunks)
-            objs_mla = (
-                d2h_mla if use_tensor_list else [c.data_ptr() for c in d2h_mla]
-            )
+            objs_mla = d2h_mla if use_tensor_list else [c.data_ptr() for c in d2h_mla]
             ops.multi_layer_block_kv_transfer(
                 paged_mla,
                 objs_mla,
@@ -2592,7 +2591,7 @@ def scenario_multi_layer_block_kv_transfer(
             )
             for i in range(num_layers):
                 for plane_idx, (orig, recon) in enumerate(
-                    zip(paged_mla[i], paged_mla_h2d[i])
+                    zip(paged_mla[i], paged_mla_h2d[i], strict=True)
                 ):
                     assert torch.allclose(orig, recon, atol=1e-6), (
                         f"MLA tuple widths={widths} layer={i} plane={plane_idx}"
@@ -2627,9 +2626,7 @@ def scenario_multi_layer_block_kv_transfer(
         ]
         if device in ("cuda"):
             d2h_mixed = [chunk.pin_memory() for chunk in d2h_mixed]
-        objs_mixed = (
-            d2h_mixed if use_tensor_list else [c.data_ptr() for c in d2h_mixed]
-        )
+        objs_mixed = d2h_mixed if use_tensor_list else [c.data_ptr() for c in d2h_mixed]
         ops.multi_layer_block_kv_transfer(
             paged_mixed,
             objs_mixed,

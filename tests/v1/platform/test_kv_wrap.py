@@ -104,26 +104,3 @@ def test_wrap_kv_caches_releases_partial_wrappers_on_failure(
         kv_wrap.wrap_kv_caches({"a": torch.zeros(1), "b": torch.zeros(1)})
 
     assert unlinked == ["seg-1"]
-
-
-def test_per_layer_planes_unwraps_arity_one_sequences() -> None:
-    a = torch.zeros(1)
-    b = torch.zeros(2)
-    c = torch.zeros(3)
-    out = kv_wrap.per_layer_planes(
-        {
-            "a": [a],
-            "b": (b, c),
-        }
-    )
-    assert out[0] is a
-    assert isinstance(out[1], tuple)
-    assert out[1][0] is b
-    assert out[1][1] is c
-
-
-def test_per_layer_planes_keeps_plain_tensor_entries() -> None:
-    a = torch.zeros(1)
-    b = torch.zeros(2)
-    out = kv_wrap.per_layer_planes({"a": a, "b": (b,)})
-    assert out == [a, b]

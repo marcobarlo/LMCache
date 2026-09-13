@@ -17,7 +17,6 @@ value (a bare tensor or a plane tuple).
 from __future__ import annotations
 
 # Standard
-from collections.abc import Sequence
 from typing import Any
 
 # Third Party
@@ -53,31 +52,6 @@ def wrap_one_kv_cache(tensor: torch.Tensor) -> Any:
     from lmcache.v1.gpu_connector.utils import get_device
 
     return resolve_kv_wrapper_factory(get_device(tensor).type)(tensor)
-
-
-def per_layer_planes(
-    kv_caches: dict[str, "torch.Tensor | Sequence[torch.Tensor]"],
-) -> list["torch.Tensor | tuple[torch.Tensor, ...]"]:
-    """Canonicalize each layer to a bare tensor or a plane tuple.
-
-    Args:
-        kv_caches: Mapping from layer name to tensor or a per-layer
-            sequence of tensors.
-
-    Returns:
-        One entry per layer in registration order. Arity-1 sequences
-        unwrap to their only tensor; larger sequences become tuples.
-    """
-    canonical: list["torch.Tensor | tuple[torch.Tensor, ...]"] = []
-    for value in kv_caches.values():
-        if isinstance(value, torch.Tensor):
-            canonical.append(value)
-            continue
-        if len(value) == 1:
-            canonical.append(value[0])
-            continue
-        canonical.append(tuple(value))
-    return canonical
 
 
 def wrap_kv_caches(

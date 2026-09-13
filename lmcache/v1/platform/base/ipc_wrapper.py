@@ -46,8 +46,8 @@ class DeviceIPCWrapper:
     the wire carries one wrapper per layer). Such a wrapper does not populate
     the singular interface
     fields -- it keeps one record per plane privately -- and its
-    ``to_tensor`` returns the bare tensor for a single-plane value or a
-    tuple of tensors otherwise.
+    ``to_tensor`` restores the registered form (bare tensor or tuple of
+    tensors).
     :class:`~lmcache.v1.platform.npu.ipc_wrapper.NpuIPCWrapper` is
     currently the only implementation; generic code must therefore not
     assume ``to_tensor()`` yields a bare tensor without checking the

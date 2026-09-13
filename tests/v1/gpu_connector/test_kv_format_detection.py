@@ -198,6 +198,24 @@ def test_vllm_dsa_tuple_three_planes():
     assert fmt == F.NL_X_NP_X_NB_BS_ONE_HS
 
 
+def test_vllm_arity_one_single_head_tuple_is_np_one():
+    # NP=1: a single-head 1-tuple registration is the plane-tuple format
+    # with one plane, not a fused rank-4 registration.
+    if not hasattr(F, "NL_X_NP_X_NB_BS_ONE_HS"):
+        pytest.skip("extension lacks NL_X_NP_X_NB_BS_ONE_HS")
+    kv = [(_t(NB, BS, 1, HS * 8),) for _ in range(NL)]
+    fmt, out = detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+    assert fmt == F.NL_X_NP_X_NB_BS_ONE_HS
+    assert [p.data_ptr() for p in out[0]] == [kv[0][0].data_ptr()]
+
+
+def test_vllm_arity_one_multi_head_tuple_rejected():
+    # Multi-head arity-1 tuples match no branch and must fail loudly.
+    kv = [(_t(NB, BS, NH, HS),) for _ in range(NL)]
+    with pytest.raises(ValueError):
+        detect_format(kv, EngineType.VLLM, {"kv_layout": "NHD"})
+
+
 def test_vllm_tuple_equal_widths_stays_kv_pair():
     # Equal-width single-head pairs are indistinguishable from generic (K, V)
     # and must keep the per-layer (K, V) tuple classification.

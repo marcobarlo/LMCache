@@ -29,21 +29,25 @@ and plane *lists* from `_adjust_kv_layout` / Mamba state tensors
 The wrapper is **plane-aggregating**: one wrapper per registered layer value,
 one `PlaneRecord` `(handle, dtype, shape, stride, storage_offset)` per plane
 inside it. On the wire (`KVCache = list[DeviceIPCWrapper]`) the list element
-count therefore equals the **layer** count, and `to_tensor()` reconstructs a
-bare tensor for single-plane values or a tuple of planes otherwise. The
-server-side `normalize_and_discover_per_layer_formats` therefore sees the
-same per-layer tensor-or-tuple entries the engine registered.
+count therefore equals the **layer** count, and `to_tensor()` restores the
+registered form faithfully: the bare tensor, or the tuple of planes — a
+1-element sequence reconstructs as a 1-tuple, not a collapsed bare tensor.
+The server-side `normalize_and_discover_per_layer_formats` therefore sees
+exactly the per-layer tensor-or-tuple entries the engine registered.
 
 This exercises the documented **multi-plane exception** of
 `DeviceIPCWrapper` (see its class docstring): the singular interface fields
-are not populated; equality compares `_plane_records` instead. `NpuIPCWrapper`
-is currently the only implementation of the exception; generic code must not
-assume `to_tensor()` returns a bare tensor without checking the device.
+are not populated; equality compares `_plane_records` plus the bare-vs-
+sequence form flag instead. `NpuIPCWrapper` is currently the only
+implementation of the exception; generic code must not assume
+`to_tensor()` returns a bare tensor without checking the device.
 
-Worker-side format discovery (`create_engine_group_infos_from_vllm`) never
-crosses the wire. It canonicalizes the engine dict with
-`kv_wrap.per_layer_planes`: arity-1 sequences unwrap to a bare tensor;
-larger sequences become tuples.
+Because the round-trip is lossless, worker-side format discovery
+(`create_engine_group_infos_from_vllm`) needs no canonicalization of its
+own: it passes the registered values to detection as-is (converting the
+engine dict to a positional list only), so both sides classify identically
+— arity-1 single-head tuples as the `NP == 1` case of
+`NL_X_NP_X_NB_BS_ONE_HS`.
 
 ## Dispatch
 
@@ -59,6 +63,7 @@ pulls the heavy connector modules).
 - CPU (upstream, `tests/v1/platform/npu/test_npu_ipc_wrapper.py`): registry
   binding, `wrap()` arity bookkeeping (storage sharing monkeypatched),
   equality/hash, pickle round-trip.
-- Device (LMCache-Ascend plugin, spawn round-trips in
-  `tests/v1/multiprocess/test_custom_types.py`): real `_share_npu_` /
-  `_new_shared_npu` reconstruction, single- and multi-plane.
+- Device (upstream, same file, `requires_npu`-gated): real `_share_npu_` /
+  `_new_shared_npu` spawn round-trip asserting bare-vs-1-tuple form
+  fidelity. The LMCache-Ascend plugin keeps broader multi-plane spawn
+  coverage in `tests/v1/multiprocess/test_custom_types.py`.

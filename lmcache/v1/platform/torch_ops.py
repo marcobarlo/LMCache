@@ -1054,12 +1054,12 @@ def _normalize_paged_layers(
         )
     if _is_kv_second_tuple_format(engine_kv_format):
         # NL_X_NP_X_NB_BS_ONE_HS carries MLA (latent, rope) or DSA
-        # (latent, rope, dsa) plane tuples of any length >= 2; every other
+        # (latent, rope, dsa) plane tuples of any length >= 1; every other
         # tuple format is an exact (K, V) pair.
         is_mla_plane_tuple = engine_kv_format == EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
         if isinstance(paged_buffer_ptrs_tensor, list) and all(
             isinstance(t, (list, tuple))
-            and (len(t) >= 2 if is_mla_plane_tuple else len(t) == 2)
+            and (len(t) >= 1 if is_mla_plane_tuple else len(t) == 2)
             and all(isinstance(x, torch.Tensor) for x in t)
             for t in paged_buffer_ptrs_tensor
         ):

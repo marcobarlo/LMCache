@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-layer MLA/DSA tuple format: ``NL x NP x [NB, BS, 1, HS]`` (NP planes).
 
-Each layer's KV cache is stored as a tuple of NP == 2 (MLA: ``latent, rope``)
-or NP == 3 (DSA: ``latent, rope, dsa``) paged tensors
-``[num_blocks, block_size, 1, width]``, produced by vLLM-Ascend for
-DeepSeek-V2/V3 MLA and V3.2 DSA models. All planes share a single latent
-KV head and their widths are mutually unequal, which is what distinguishes
-this format from the per-layer ``(K, V)`` tuple format
-(:class:`NL_X_TWO_X_NB_BS_NH_HS_Spec`) shape-wise.
+Each layer's KV cache is stored as a tuple of NP >= 1 paged tensors
+``[num_blocks, block_size, 1, width]``: NP == 2 (MLA: ``latent, rope``),
+NP == 3 (DSA: ``latent, rope, dsa``), or NP == 1 (latent-only), produced
+by vLLM-Ascend for DeepSeek-V2/V3 MLA and V3.2 DSA models. All planes
+share a single latent KV head and their widths are mutually unequal,
+which is what distinguishes this format from the per-layer ``(K, V)``
+tuple format (:class:`NL_X_TWO_X_NB_BS_NH_HS_Spec`) shape-wise.
 
 Like ``NL_X_NB_BS_HS`` the transferred object is one flat plane of the
 **summed** width (``kv_size == 1``, ``is_mla``); only the paged source
