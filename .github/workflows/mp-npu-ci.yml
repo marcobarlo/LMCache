@@ -1,0 +1,41 @@
+name: Trigger 910B3 NPU tests
+
+# The 910B3 runner is registered on marcobarlo/LMCache-Ascend only.
+# This workflow fans out to that repo's mp-npu-ci job.
+on:
+  push:
+    branches: [MP_dsv4_3_split]
+  workflow_dispatch:
+
+concurrency:
+  group: mp-npu-dispatch-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch to LMCache-Ascend
+    runs-on: ubuntu-latest
+    steps:
+      - name: repository-dispatch marcobarlo/LMCache-Ascend
+        env:
+          GH_TOKEN: ${{ secrets.MP_NPU_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo '::error::Add repo secret MP_NPU_DISPATCH_TOKEN: a PAT that can POST /repos/marcobarlo/LMCache-Ascend/dispatches (public_repo, or fine-grained Actions: write).'
+            exit 1
+          fi
+          gh api repos/marcobarlo/LMCache-Ascend/dispatches --input - <<EOF
+          {
+            "event_type": "mp-npu-ci",
+            "client_payload": {
+              "sha": "${GITHUB_SHA}",
+              "ref": "${GITHUB_REF_NAME}"
+            }
+          }
+          EOF
+          echo "Dispatched mp-npu-ci for ${GITHUB_SHA}"
+          echo "Watch: https://github.com/marcobarlo/LMCache-Ascend/actions/workflows/mp-npu-ci.yml"
