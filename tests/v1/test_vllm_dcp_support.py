@@ -268,20 +268,6 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass
-class MLAAttentionSpec(AttentionSpec):
-    """Upstream MLA double: block_size is already logical tokens."""
-
-    compress_ratio: int = 1
-
-
-@dataclass
-class PhysicalSlotAttentionSpec(AttentionSpec):
-    """Spec whose ``block_size`` is physical slots; token span is separate."""
-
-    logical_block_size: int
-
-
-@dataclass
 class UniformTypeKVCacheSpecs:
     """Double for vLLM's container: derives from KVCacheSpec, not
     AttentionSpec, so it must be unwrapped before the MRO check."""
@@ -635,20 +621,6 @@ def test_uniform_type_wrapper_of_mamba_is_not_scaled():
         block_size=1024, kv_cache_specs={"l0": _FakeMambaSpec(block_size=1024)}
     )
     assert get_tokens_per_block(wrapped, 4) == 1024
-
-
-def test_upstream_compress_ratio_does_not_scale_block_size() -> None:
-    """Upstream MLA keeps block_size in logical-token units."""
-    spec = MLAAttentionSpec(block_size=32, compress_ratio=128)
-    assert get_tokens_per_block(spec, 1) == 32
-    assert get_tokens_per_block(spec, 2) == 64
-
-
-def test_logical_block_size_overrides_physical_block_size() -> None:
-    """Engines whose pages are physical slots expose token span separately."""
-    spec = PhysicalSlotAttentionSpec(block_size=32, logical_block_size=4096)
-    assert get_tokens_per_block(spec, 1) == 4096
-    assert get_tokens_per_block(spec, 2) == 8192
 
 
 @pytest.mark.parametrize(

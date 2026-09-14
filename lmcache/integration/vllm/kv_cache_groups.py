@@ -39,7 +39,7 @@ def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
     (vLLM's ``resolve_kv_cache_block_sizes`` rule); recurrent state is
     replicated, not sharded, and stays at ``block_size``.
     """
-    block_size = getattr(kv_cache_spec, "logical_block_size", kv_cache_spec.block_size)
+    block_size = kv_cache_spec.block_size
     if dcp_size <= 1:
         return block_size
     if _is_attention_spec(kv_cache_spec):
