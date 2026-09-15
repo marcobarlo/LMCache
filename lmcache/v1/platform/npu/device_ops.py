@@ -23,7 +23,6 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.platform import torch_ops
 from lmcache.v1.platform.base.device_ops import DeviceOps
-from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)
@@ -81,10 +80,9 @@ class NpuDeviceOps(DeviceOps):
             )
             return
         self.bind_native(native)
-        # bind_native copies c_ops.PageBufferShapeDesc (unused local C++
-        # type). Install the Python subclass so extras (dtype, plane
-        # widths/strides) have typed defaults; CUDA casters still drop them.
-        self.PageBufferShapeDesc = NpuPageBufferShapeDesc
+        # bind_native copies c_ops.PageBufferShapeDesc (NPU struct + extras).
+        # Factory uses device_ops.PageBufferShapeDesc(); NPU kernels take
+        # that class by value. CUDA keeps lmcache_native's 8-field type.
         # The plugin's c_ops re-exports torch-fallback symbols the compiled
         # module lacks; instance-binding those would shadow the class-level
         # stream-ordered overrides below (the storage ownership contract).
