@@ -145,3 +145,25 @@ def test_genuine_native_recorder_binding_is_kept(
     ops.ensure_native()
     assert ops.__dict__["record_completion_on_stream"] is _native_recorder
     assert ops.__dict__["record_event_on_stream"] is _native_event_recorder
+
+
+def test_ensure_native_installs_npu_page_buffer_shape_desc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """bind_native must not leave the plugin's unused C++ desc type bound."""
+
+    class _CppDesc:
+        pass
+
+    _install_fake_c_ops(monkeypatch, PageBufferShapeDesc=_CppDesc)
+    ops = NpuDeviceOps()
+    ops.ensure_native()
+    from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
+
+    assert ops.PageBufferShapeDesc is NpuPageBufferShapeDesc
+    desc = ops.PageBufferShapeDesc()
+    assert isinstance(desc, NpuPageBufferShapeDesc)
+    assert desc.num_planes == 0
+    assert desc.plane_slot_bytes == ()
+    assert desc.plane_block_stride_bytes == ()
+

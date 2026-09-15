@@ -737,6 +737,9 @@ def make_page_buffer_shape_desc(
         planes = kv_caches[layer_idx]
         desc.plane_widths = tuple(int(t.shape[-1]) for t in planes)
         desc.plane_dtypes = tuple(t.dtype for t in planes)
+        desc.plane_block_stride_bytes = tuple(
+            int(t.stride(0)) * int(t.element_size()) for t in planes
+        )
     return desc
 
 
