@@ -530,11 +530,9 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # compressor / indexer caches sharing a KV pool with larger attn
 # groups).
 #
-# ``NL_X_NP_X_NB_BS_ONE_HS`` (vLLM-Ascend w8a8 MLA latent+scale tuples)
-# is included because measured DSv4 planes share one per-block *byte*
-# step (latent: 16640 int8 elems; scale: 8320 float16 elems). A
-# sibling-plane check in :func:`resolve_block_stride_and_log_layout`
-# rejects tuples whose per-block byte strides disagree.
+# ``NL_X_NP_X_NB_BS_ONE_HS`` (vLLM-Ascend MLA/DSA plane tuples) is
+# included so dim-0-padded DSv4 planes use stride(0) as the per-block
+# step instead of failing the non-block-axis padding check below.
 #
 # ``NL_X_NB_TWO_BS_NH_HS`` *could* in principle also be the block
 # axis on dim-0, but no real serving engine emits a padded layout of
@@ -559,41 +557,6 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
         lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
 )
-
-
-def _block_byte_stride(tensor: torch.Tensor) -> int:
-    """Bytes stepped along the paged block axis (``stride(0) * element_size``).
-
-    For vLLM-Ascend paged KV, dim 0 is ``NB``; this is the per-block pool
-    slot size in bytes, not the last-axis plane width.
-    """
-    return int(tensor.stride(0)) * int(tensor.element_size())
-
-
-def _assert_tuple_planes_share_block_byte_stride(
-    planes: object,
-    probe: torch.Tensor,
-    engine_kv_format: "lmcache_native.EngineKVFormat",
-) -> None:
-    """Reject multi-plane layers whose per-block byte strides disagree.
-
-    ``PageBufferShapeDesc.block_stride_elems`` is one int per kernel
-    group. Independently-strided planes cannot share it; fail closed.
-    """
-    if not isinstance(planes, (list, tuple)):
-        return
-    expected = _block_byte_stride(probe)
-    for i, plane in enumerate(planes):
-        if not isinstance(plane, torch.Tensor):
-            continue
-        got = _block_byte_stride(plane)
-        if got != expected:
-            raise ValueError(
-                "resolve_block_stride_and_log_layout: plane "
-                f"{i} block byte stride {got} != probe {expected} for "
-                f"{engine_kv_format!r}; a single block_stride_elems "
-                "cannot describe independently-strided planes."
-            )
 
 
 def resolve_block_stride_and_log_layout(
@@ -658,12 +621,6 @@ def resolve_block_stride_and_log_layout(
 
     block_stride_elems: Optional[int]
     if engine_kv_format in _BLOCK_AXIS_FORMATS and rep.ndim > 0:
-        if lmcache_native.is_kv_second_tuple(engine_kv_format):
-            _assert_tuple_planes_share_block_byte_stride(
-                kv_caches[layer_idx],  # type: ignore[index]
-                rep,
-                engine_kv_format,
-            )
         block_stride_elems = int(rep.stride(0))
     else:
         # Non-block-axis format: detect forbidden dim-0 padding.
@@ -776,6 +733,10 @@ def make_page_buffer_shape_desc(
 
     resolved_stride = int(block_stride_elems) if block_stride_elems else 0
     desc.block_stride_elems = resolved_stride
+    if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS:
+        planes = kv_caches[layer_idx]
+        desc.plane_widths = tuple(int(t.shape[-1]) for t in planes)
+        desc.plane_dtypes = tuple(t.dtype for t in planes)
     return desc
 
 
