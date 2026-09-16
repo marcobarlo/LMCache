@@ -733,13 +733,19 @@ def make_page_buffer_shape_desc(
 
     resolved_stride = int(block_stride_elems) if block_stride_elems else 0
     desc.block_stride_elems = resolved_stride
-    if engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS:
+    # Per-layer plane-tuple formats carry explicit per-plane byte geometry:
+    # fmt 17 (MLA/DSA planes [NB, BS, 1, HS]) and fmt 16 ((K, V) planes
+    # [NB, BS, NH, HS]) share the same per-layer tuple structure. The
+    # per-token row is the product of the trailing two dims (shape[2] == 1
+    # for fmt 17, reducing to its plane width).
+    if engine_kv_format in (
+        lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
+        lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS,
+    ):
         planes = kv_caches[layer_idx]
-        desc.plane_widths = tuple(int(t.shape[-1]) for t in planes)
-        desc.plane_dtypes = tuple(t.dtype for t in planes)
         desc.num_planes = len(planes)
         desc.plane_slot_bytes = tuple(
-            int(t.shape[-1]) * int(t.element_size()) for t in planes
+            int(t.shape[2]) * int(t.shape[3]) * int(t.element_size()) for t in planes
         )
         desc.plane_block_stride_bytes = tuple(
             int(t.stride(0)) * int(t.element_size()) for t in planes
