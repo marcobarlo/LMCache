@@ -200,10 +200,12 @@ class NpuIPCWrapper(DeviceIPCWrapper):
                 "info",
                 "-t",
                 "board",
+                # 16-davinci hosts enumerate 8 NPUs x 2 chips: npu-smi's -i
+                # covers only 0-7, so map the device ordinal onto (npu, chip).
                 "-i",
-                str(device_index),
+                str(device_index // 2),
                 "-c",
-                "0",
+                str(device_index % 2),
             ]
             result = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode(
                 "utf-8"

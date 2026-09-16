@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 # Third Party
@@ -27,6 +28,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import KVCache
 from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+import lmcache.lmcache_native as lmcache_native
 
 if TYPE_CHECKING:
     # First Party
@@ -340,6 +342,16 @@ class NpuCacheContext(BaseCacheContext):
                 torch.tensor(ptrs, dtype=torch.int64, device=self.device_)
             )
 
+        # Registration-time transfer geometry: patch every kernel group's
+        # shape descriptor with the validated per-plane facts and reject
+        # groups whose layers do not share one layout, then validate the
+        # registered views' write ownership. All of it runs before the
+        # first transfer; a missing plugin keeps the legacy descriptor
+        # fields and skips the checks (soft-fail, same as CUDA).
+        group_metas = self._resolve_group_transfer_geometry()
+        if group_metas is not None:
+            self._validate_registered_view_ownership(group_metas)
+
         self._temp_buffer = _TempNpuBuffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
@@ -401,6 +413,107 @@ class NpuCacheContext(BaseCacheContext):
             Device int64 pointer table for the group.
         """
         return self.group_kv_pointers_[kernel_group_idx]
+
+    def _resolve_group_transfer_geometry(self) -> list[list[Any] | None] | None:
+        """Patch shape descriptors and prove per-group layout homogeneity.
+
+        For every layer-list kernel group this collects the Ascend plugin's
+        validated per-plane geometry once, then:
+
+        * raises if layers merged into one kernel group do NOT share the
+          same geometry signature -- the shared identity key does not
+          carry plane splits, so a mixed group would address one layout
+          with another layout's descriptor (fail closed at registration,
+          before any transfer exists);
+        * fills the group's shape descriptor plane fields from the
+          representative layer's validated facts, replacing the legacy
+          per-shape derivation done by ``make_page_buffer_shape_desc``.
+
+        Returns:
+            Per-kernel-group lists of per-layer metadata (``None`` entries
+            for unsupported formats), or ``None`` when the Ascend plugin
+            is not installed.
+        """
+        try:
+            # Third Party
+            import lmcache_ascend.v1.block_transfer_layout as ascend_layout
+        except ImportError:
+            return None
+
+        group_metas: list[list[Any] | None] = []
+        for kg_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
+            fmt = self.get_engine_kv_format(kg_idx)
+            if not lmcache_native.is_layer_list(fmt):
+                group_metas.append(None)
+                continue
+            metas = [
+                ascend_layout.make_transfer_metadata(
+                    self.kv_caches_[layer_idx], fmt
+                )
+                for layer_idx in group.layer_indices
+            ]
+            present = [m for m in metas if m is not None]
+            if present:
+                # Same format per group (format is in the identity), so the
+                # metadata is either all-None or all-present.
+                signatures = {m.signature for m in present}
+                if len(signatures) > 1:
+                    raise ValueError(
+                        f"kernel group {kg_idx} merges layers with different "
+                        "plane geometries (same identity key, different "
+                        "layout); one shared descriptor cannot address them"
+                    )
+                ascend_layout.apply_transfer_metadata(
+                    self.kv_layer_groups_manager_.get_shape_desc(kg_idx),
+                    present[0],
+                )
+            group_metas.append(metas)
+        return group_metas
+
+    def _validate_registered_view_ownership(
+        self, group_metas: list[list[Any] | None]
+    ) -> None:
+        """Registration-time cross-view write-ownership check.
+
+        Every registered plane view that concurrent kernel work items may
+        write is expanded to the 32B-extended page cells it covers.
+        Runs once at context creation, never on the transfer hot path.
+        The check is conservative: exotic but legal interleavings may be
+        rejected -- a documented first-version scope limit, not a silent
+        risk.
+        """
+        # Third Party
+        import lmcache_ascend.v1.block_transfer_layout as ascend_layout
+
+        separate_plane_fmt = int(EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
+        views: list[Any] = []
+        for kg_idx, group in enumerate(self.kv_layer_groups_manager_.kernel_groups):
+            metas = group_metas[kg_idx]
+            if metas is None:
+                continue
+            fmt = self.get_engine_kv_format(kg_idx)
+            for layer_idx, metadata in zip(
+                group.layer_indices, metas, strict=True
+            ):
+                if metadata is None:
+                    continue
+                entry = self.kv_caches_[layer_idx]
+                planes = list(entry) if isinstance(entry, (tuple, list)) else [entry]
+                # Format 16 moves K and V as separate work items, so the
+                # plane index joins the owner; packed formats finish one
+                # page's planes inside a single work item and share the
+                # layer owner.
+                separate_plane = int(fmt) == separate_plane_fmt
+                for plane_idx, (tensor, facts) in enumerate(
+                    zip(planes, metadata.facts, strict=True)
+                ):
+                    owner: tuple = (group.engine_group_idx, layer_idx)
+                    if separate_plane:
+                        owner = (*owner, plane_idx)
+                    views.append(
+                        SimpleNamespace(tensor=tensor, facts=facts, owner=owner)
+                    )
+        ascend_layout.validate_write_ownership(views)
 
     def get_temp_kernel_group_buffer(
         self,
