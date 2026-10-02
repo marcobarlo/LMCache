@@ -16,3 +16,12 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "mooncake":
         raise
+
+try:
+    # First Party
+    from lmcache.v1.distributed.transfer_channel.impl import (  # noqa: F401
+        hixl_impl,
+    )
+except ModuleNotFoundError as e:
+    if e.name != "torch_npu" and not (e.name or "").startswith("lmcache_ascend"):
+        raise
