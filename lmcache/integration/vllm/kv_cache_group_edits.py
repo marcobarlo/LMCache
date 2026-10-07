@@ -254,8 +254,9 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
     name = "mamba-page-view"
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
-        # Conv's per-block stride must be the full page. A slice-sized stride
-        # passes through; apply re-strides only the packed layout.
+        # Conv's per-block stride must equal the full packed page. Any list
+        # whose per-block stride is only a state slice passes through (e.g.
+        # vLLM-Ascend registers conv and ssm as separate contiguous tensors).
         return (
             get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
             and isinstance(kv_cache, list)

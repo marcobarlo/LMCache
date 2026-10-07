@@ -418,7 +418,12 @@ def test_subpaged_apply_rejects_unknown_rank(edits):
 
 
 def test_mamba_page_view_skips_slice_strided_list(edits):
-    """A conv stride equal to the slice, not the page, passes through."""
+    """Slice-strided conv passes through; only a page stride matches.
+
+    Models with separate contiguous conv/ssm tensors (e.g. vLLM-Ascend) are
+    modeled here via ``torch.zeros``: block stride is the conv slice, not
+    ``page_size_bytes``.
+    """
     packed, page_bytes = _mamba_kv_cache()
     caches = [
         torch.zeros(packed[0].shape, dtype=packed[0].dtype),
