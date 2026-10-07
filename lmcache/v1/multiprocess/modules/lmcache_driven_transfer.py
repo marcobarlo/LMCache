@@ -453,6 +453,36 @@ def _run_object_group_transfer_plan(
     )
 
 
+def _queue_h2d_copies(
+    cache_context: BaseCacheContext,
+    copies: Sequence[tuple[MemoryObj, torch.Tensor]],
+) -> None:
+    """Publish host-to-device copies, then order them before ``cache_context.stream``.
+
+    With one stream, descriptor creation for a cold window runs longer than
+    the copy and the engine goes idle. ``cache_context.h2d_streams`` spreads
+    the copies across submission queues. The main stream waits for every
+    other queue before the caller launches the scatter kernel.
+
+    Args:
+        cache_context: Context whose stream will consume the copies.
+        copies: Pairs of source memory object and destination tensor.
+    """
+    streams = list(getattr(cache_context, "h2d_streams", None) or ())
+    if len(streams) <= 1:
+        for memory_obj, destination in copies:
+            lmcache_memcpy_async_h2d(memory_obj, destination)
+        return
+
+    for index, (memory_obj, destination) in enumerate(copies):
+        with torch_dev.stream(streams[index % len(streams)]):
+            lmcache_memcpy_async_h2d(memory_obj, destination)
+    main = cache_context.stream
+    for side in streams:
+        if side is not main:
+            main.wait_stream(side)
+
+
 def transfer_kv_per_object_group(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
@@ -543,15 +573,22 @@ def transfer_kv_per_object_group(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
-        # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
+        # For H2D, copy from CPU to GPU tmp buffers before the kernel launch.
+        # Several streams overlap descriptor creation; the main stream waits
+        # before the scatter kernel reads those buffers.
         if is_h2d:
-            for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                lmcache_memcpy_async_h2d(
-                    memory_obj,
-                    cache_context.get_temp_object_group_buffer(
-                        chunk_idx, object_group_id
-                    ),
-                )
+            _queue_h2d_copies(
+                cache_context,
+                [
+                    (
+                        memory_obj,
+                        cache_context.get_temp_object_group_buffer(
+                            chunk_idx, object_group_id
+                        ),
+                    )
+                    for chunk_idx, memory_obj in enumerate(memory_object_batch)
+                ],
+            )
 
         # Do paged KV copy
         for kernel_group_id in kernel_group_ids:

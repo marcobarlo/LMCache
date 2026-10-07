@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Sequence
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 # Third Party
@@ -32,6 +33,17 @@ if TYPE_CHECKING:
     from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 
 logger = init_logger(__name__)
+
+
+def _h2d_stream_count() -> int:
+    """Return how many streams should publish host-to-device descriptors."""
+    raw = os.environ.get("LMCACHE_H2D_STREAMS", "4")
+    try:
+        count = int(raw)
+    except ValueError:
+        logger.warning("Invalid LMCACHE_H2D_STREAMS=%r; using 4", raw)
+        return 4
+    return max(1, count)
 
 
 class _NpuHostCallbackStream:
@@ -338,6 +350,9 @@ class NpuCacheContext(BaseCacheContext):
             max_batch_size=4,
         )
         self.stream_ = torch_dev.Stream(device=self.device_)
+        self.h2d_streams_ = [self.stream_]
+        for _ in range(_h2d_stream_count() - 1):
+            self.h2d_streams_.append(torch_dev.Stream(device=self.device_))
         self.host_callback_stream_ = _NpuHostCallbackStream(self.stream_)
 
         logger.debug(
@@ -349,14 +364,14 @@ class NpuCacheContext(BaseCacheContext):
 
     def close(self) -> None:
         """Synchronize transfers and release receiver-side IPC owners."""
+        for stream in getattr(self, "h2d_streams_", ()):
+            synchronize = getattr(stream, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+
         wrappers = self._ipc_wrappers
         if not wrappers:
             return
-
-        stream = getattr(self, "stream_", None)
-        synchronize = getattr(stream, "synchronize", None)
-        if callable(synchronize):
-            synchronize()
 
         kv_tensors = getattr(self, "kv_caches_", None)
         if isinstance(kv_tensors, list):
@@ -372,6 +387,16 @@ class NpuCacheContext(BaseCacheContext):
     def stream(self) -> Any:
         """Return the NPU stream used for transfer work."""
         return self.stream_
+
+    @property
+    def h2d_streams(self) -> list[Any]:
+        """Streams that publish host-to-device copies.
+
+        The first entry is :attr:`stream`. Further entries come from
+        ``LMCACHE_H2D_STREAMS`` (default 4) so descriptor creation can
+        overlap on separate submission queues.
+        """
+        return self.h2d_streams_
 
     @property
     def cupy_stream(self) -> _NpuHostCallbackStream:
