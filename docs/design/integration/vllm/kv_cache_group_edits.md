@@ -44,7 +44,8 @@ contiguously in one padded page (`conv | ssm | pad`). The raw pair trips
 format discovery (the SSM view starts mid-page). The edit reinterprets each
 page as one bf16 tensor shaped `(num_blocks, 2, block_size, 1, head_size)`
 over the same storage, where `head_size` is derived so the bytes fill the page
-exactly.
+exactly. `matches` requires the conv state's per-block stride to equal
+`page_size_bytes`; a list whose stride is only the slice passes through.
 
 ### 2. Sub-paged full attention
 

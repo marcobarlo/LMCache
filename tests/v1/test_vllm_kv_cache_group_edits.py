@@ -417,6 +417,23 @@ def test_subpaged_apply_rejects_unknown_rank(edits):
         edit.apply(_attention_spec(), torch.zeros(4, 8, 8), {})
 
 
+def test_mamba_page_view_skips_slice_strided_list(edits):
+    """A conv stride equal to the slice, not the page, passes through."""
+    packed, page_bytes = _mamba_kv_cache()
+    caches = [
+        torch.zeros(packed[0].shape, dtype=packed[0].dtype),
+        torch.zeros(packed[1].shape, dtype=packed[1].dtype),
+    ]
+    spec = _mamba_spec(page_bytes)
+    assert not edits._MambaPageViewEdit().matches(spec, caches)
+
+    config = _Config(
+        kv_cache_groups=[_Group(layer_names=["mamba.0"], kv_cache_spec=spec)]
+    )
+    edited = edits.apply_kv_cache_group_edits(config, {"mamba.0": caches}, {})
+    assert edited["mamba.0"] is caches
+
+
 # --------------------------------------------------------------------------
 # End to end: both edits fire together on the hybrid geometry
 # --------------------------------------------------------------------------

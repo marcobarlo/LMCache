@@ -254,8 +254,14 @@ class _MambaPageViewEdit(KVCacheGroupEdit):
     name = "mamba-page-view"
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
-        return get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA and isinstance(
-            kv_cache, list
+        # Conv's per-block stride must be the full page. A slice-sized stride
+        # passes through; apply re-strides only the packed layout.
+        return (
+            get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
+            and isinstance(kv_cache, list)
+            and bool(kv_cache)
+            and kv_cache[0].stride(0) * kv_cache[0].element_size()
+            == spec.page_size_bytes
         )
 
     def apply(
