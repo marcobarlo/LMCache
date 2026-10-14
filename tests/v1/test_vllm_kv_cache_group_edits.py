@@ -36,6 +36,8 @@ import sys
 import pytest
 import torch
 
+pytestmark = pytest.mark.no_shared_allocator
+
 # One registered cache value, mirroring the module's own ``RegisteredKVCache``:
 # a paged KV tensor, or ``[conv_state, ssm_state]`` for Mamba layers.
 _RegisteredKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
@@ -633,11 +635,13 @@ def _subpaged_kv_planes(
     prefix_elems: int = 0,
     interleaved: bool = True,
     contiguous: bool = False,
+    num_kv_heads: int = 1,
+    inner_stride: tuple[int, int, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, _Spec, torch.Tensor]:
     """Rank-4 K and V planes paged below the scheduler block.
 
-    Shape ``(num_kernel_pages, kernel_block_size, 1, head_size)`` with
-    ``kernel_block_size < spec.block_size``. ``interleaved=True`` is the
+    Shape ``(num_kernel_pages, kernel_block_size, num_kv_heads, head_size)``
+    with ``kernel_block_size < spec.block_size``. ``interleaved=True`` is the
     vLLM-Ascend v0.30 pool: K's ``stride(0)`` covers one K row plus the
     following V row. ``contiguous=True`` is vLLM-Ascend <= v0.29: every K
     kernel page, then every V kernel page, each plane dense.
@@ -650,7 +654,7 @@ def _subpaged_kv_planes(
     head_size = 4
     num_logical_blocks = 2
     num_kernel_pages = num_logical_blocks * ratio
-    row_elems = kernel_block_size * head_size
+    row_elems = kernel_block_size * num_kv_heads * head_size
     if contiguous:
         kernel_stride_elems = row_elems
         plane_count = 2
@@ -662,8 +666,11 @@ def _subpaged_kv_planes(
         dtype=torch.bfloat16,
     )
     storage[:prefix_elems] = -1
-    shape = (num_kernel_pages, kernel_block_size, 1, head_size)
-    stride = (kernel_stride_elems, head_size, head_size, 1)
+    shape = (num_kernel_pages, kernel_block_size, num_kv_heads, head_size)
+    if inner_stride is None:
+        stride = (kernel_stride_elems, num_kv_heads * head_size, head_size, 1)
+    else:
+        stride = inner_stride
     k_plane = storage.as_strided(shape, stride, storage_offset=prefix_elems)
     if contiguous:
         v_offset = prefix_elems + num_kernel_pages * row_elems
@@ -680,7 +687,8 @@ def _subpaged_kv_planes(
     return k_plane, v_plane, spec, storage
 
 
-def test_subpaged_plane_edit_fires_on_interleaved_kv(edits):
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_subpaged_plane_edit_fires_on_interleaved_kv(edits, num_kv_heads):
     """vLLM-Ascend v0.30 interleaved K/V planes must be re-paged.
 
     The fused rank-4/5 rule does not match a pair, so the interleaved rule
@@ -688,7 +696,7 @@ def test_subpaged_plane_edit_fires_on_interleaved_kv(edits):
     plane (format 17 when wrapped in a one-element list), and the
     contiguous rule must not also match.
     """
-    k_plane, v_plane, spec, _storage = _subpaged_kv_planes()
+    k_plane, v_plane, spec, _storage = _subpaged_kv_planes(num_kv_heads=num_kv_heads)
     pair = (k_plane, v_plane)
     interleaved = edits._SubpagedAttentionInterleavedPlaneViewEdit()
     contiguous = edits._SubpagedAttentionContiguousPlaneViewEdit()
@@ -711,14 +719,17 @@ def test_subpaged_plane_edit_fires_on_interleaved_kv(edits):
     assert int(plane.storage_offset()) == uint8_offset
 
 
-def test_subpaged_plane_edit_groups_contiguous_kernel_pages(edits):
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+def test_subpaged_plane_edit_groups_contiguous_kernel_pages(edits, num_kv_heads):
     """Logical block ``n`` must cover kernel pages ``n*k .. n*k+k-1``.
 
     vLLM-Ascend v0.30 interleaves those pages in one pool, and bytes before
     K's storage offset are not part of block 0.
     """
     prefix_elems = 17
-    k_plane, v_plane, spec, storage = _subpaged_kv_planes(prefix_elems=prefix_elems)
+    k_plane, v_plane, spec, storage = _subpaged_kv_planes(
+        prefix_elems=prefix_elems, num_kv_heads=num_kv_heads
+    )
     plane = _edit_attention(edits, (k_plane, v_plane), attention_spec=spec)[0]
 
     raw = storage.view(torch.uint8)
@@ -730,6 +741,26 @@ def test_subpaged_plane_edit_groups_contiguous_kernel_pages(edits):
             plane[block].reshape(-1), raw[start : start + page_bytes]
         )
     assert int(raw[0]) != int(plane.reshape(-1)[0])
+
+
+def test_subpaged_plane_edit_rejects_non_dense_interleaved_inner_stride(edits):
+    """Interleaved dim-0 stride is not enough without a dense NHD row."""
+    k_plane, v_plane, spec, _storage = _subpaged_kv_planes(num_kv_heads=4)
+    kernel_stride_elems = int(k_plane.stride(0))
+    bad_stride = (kernel_stride_elems, 4, 8, 1)
+    k_bad = k_plane.as_strided(k_plane.shape, bad_stride, k_plane.storage_offset())
+    v_bad = v_plane.as_strided(v_plane.shape, bad_stride, v_plane.storage_offset())
+    interleaved = edits._SubpagedAttentionInterleavedPlaneViewEdit()
+    assert not interleaved.matches(spec, (k_bad, v_bad))
+
+
+def test_subpaged_plane_edit_rejects_interleaved_separate_storage(edits):
+    """K and V must share one pool; separate allocations are not interleaved."""
+    k_plane, v_plane, spec, _storage = _subpaged_kv_planes(num_kv_heads=4)
+    v_clone = v_plane.clone()
+    assert v_clone.untyped_storage().data_ptr() != k_plane.untyped_storage().data_ptr()
+    interleaved = edits._SubpagedAttentionInterleavedPlaneViewEdit()
+    assert not interleaved.matches(spec, (k_plane, v_clone))
 
 
 def test_subpaged_plane_edit_rejects_separate_kv_planes(edits):

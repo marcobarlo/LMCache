@@ -759,13 +759,16 @@ def _subpaged_plane_pair_ratio(
     """Return the logical/kernel block ratio for a sub-paged rank-4 pair.
 
     ``None`` means the pair is not a standard-paged attention cache whose
-    kernel block evenly divides the scheduler block.
+    kernel block evenly divides the scheduler block, or K/V differ in dtype
+    or device.
     """
     if get_kv_cache_spec_kind(
         spec
     ) not in _SUBPAGEABLE_ATTENTION_KINDS or _declares_slot_compression(spec):
         return None
     if k_plane.ndim != 4 or v_plane.ndim != 4 or k_plane.shape != v_plane.shape:
+        return None
+    if k_plane.dtype != v_plane.dtype or k_plane.device != v_plane.device:
         return None
     kernel_block_size = int(k_plane.shape[1])
     logical_block_size = int(spec.block_size)
@@ -779,6 +782,49 @@ def _subpaged_plane_pair_ratio(
     if int(k_plane.shape[0]) % ratio != 0:
         return None
     return ratio
+
+
+def _dense_trailing_nhd_row(plane: torch.Tensor) -> bool:
+    """Whether ``plane`` has a dense NHD row on axes 1..3.
+
+    Dim 0 may be gapped (interleaved K/V kernel pages); only the trailing
+    ``(kernel_block, num_heads, head_size)`` slice must be dense.
+    """
+    if plane.ndim != 4:
+        return False
+    num_heads, head_size = int(plane.shape[2]), int(plane.shape[3])
+    return (
+        int(plane.stride(3)) == 1
+        and int(plane.stride(2)) == head_size
+        and int(plane.stride(1)) == num_heads * head_size
+    )
+
+
+def _is_interleaved_kernel_kv_pair(
+    k_plane: torch.Tensor,
+    v_plane: torch.Tensor,
+    *,
+    ratio: int,
+    page_size_bytes: int,
+) -> bool:
+    """Return whether K/V are v0.30 interleaved kernel pages in one pool."""
+    if not (_dense_trailing_nhd_row(k_plane) and _dense_trailing_nhd_row(v_plane)):
+        return False
+    row_elems = int(k_plane.shape[1:].numel())
+    row_bytes = row_elems * int(k_plane.element_size())
+    kernel_stride_bytes = int(k_plane.stride(0)) * int(k_plane.element_size())
+    if kernel_stride_bytes != 2 * row_bytes or int(v_plane.stride(0)) != int(
+        k_plane.stride(0)
+    ):
+        return False
+    if k_plane.untyped_storage().data_ptr() != v_plane.untyped_storage().data_ptr():
+        return False
+    if v_plane.storage_offset() != k_plane.storage_offset() + row_elems:
+        return False
+    ptr_gap = v_plane.data_ptr() - k_plane.data_ptr()
+    if ptr_gap != row_elems * int(k_plane.element_size()):
+        return False
+    return kernel_stride_bytes * ratio == page_size_bytes
 
 
 class _SubpagedAttentionInterleavedPlaneViewEdit(KVCacheGroupEdit):
@@ -813,20 +859,12 @@ class _SubpagedAttentionInterleavedPlaneViewEdit(KVCacheGroupEdit):
         ratio = _subpaged_plane_pair_ratio(spec, k_plane, v_plane)
         if ratio is None:
             return False
-        row_elems = int(k_plane.shape[1:].numel())
-        row_bytes = row_elems * int(k_plane.element_size())
-        kernel_stride_bytes = int(k_plane.stride(0)) * int(k_plane.element_size())
-        # One KV head per rank makes index 2 equal 1. A wider head axis is
-        # not this interleaved NHD layout.
-        if not (
-            int(k_plane.shape[2]) == 1
-            and kernel_stride_bytes == 2 * row_bytes
-            and v_plane.stride(0) == k_plane.stride(0)
-            and v_plane.element_size() == k_plane.element_size()
-            and v_plane.storage_offset() == k_plane.storage_offset() + row_elems
-        ):
-            return False
-        return kernel_stride_bytes * ratio == int(spec.page_size_bytes)
+        return _is_interleaved_kernel_kv_pair(
+            k_plane,
+            v_plane,
+            ratio=ratio,
+            page_size_bytes=int(spec.page_size_bytes),
+        )
 
     def apply(
         self,
@@ -914,11 +952,7 @@ class _SubpagedAttentionContiguousPlaneViewEdit(KVCacheGroupEdit):
         ratio = _subpaged_plane_pair_ratio(spec, k_plane, v_plane)
         if ratio is None:
             return False
-        if not (
-            k_plane.is_contiguous()
-            and v_plane.is_contiguous()
-            and k_plane.dtype == v_plane.dtype
-        ):
+        if not (k_plane.is_contiguous() and v_plane.is_contiguous()):
             return False
         row_bytes = int(k_plane.shape[1:].numel()) * int(k_plane.element_size())
         return 2 * row_bytes * ratio == _unpadded_attention_page_bytes(spec)

@@ -133,6 +133,14 @@ registered shape; they differ in how K and V bytes are laid out in memory:
 | `<= v0.29` | `(num_kernel_pages, kernel_block_size, num_kv_heads, head_size)` | rank 4; dense K kernel pages, then dense V (one pool or two allocations) |
 | `v0.30` | `(num_kernel_pages, kernel_block_size, num_kv_heads, head_size)` | rank 4; `[K0][V0][K1][V1]…` in one pool (`stride(0)` spans one K row plus the following V row) |
 
+On v0.30 the input planes may carry one or more TP-local KV heads on axis 2;
+all of those heads are folded into each kernel row (`row_elems =
+kernel_block_size * num_kv_heads * head_size`). The interleaved matcher
+requires a dense trailing NHD slice on axes 1..3, K/V in the same underlying
+storage with V one row after K, and dim-0 stride `2 * row_bytes`. Whole-tensor
+`is_contiguous()` is intentionally not required because dim 0 skips the
+interleaved partner row.
+
 Through v0.29, `_SubpagedAttentionContiguousPlaneViewEdit` re-views each plane
 to `(num_logical_blocks, scheduler_block_size, num_kv_heads, head_size)`
 (format 16, `NL_X_TWO_X_NB_BS_NH_HS`). The tile check uses
@@ -141,7 +149,9 @@ padding absent from the K/V views. v0.30's
 `_SubpagedAttentionInterleavedPlaneViewEdit` returns one uint8 plane
 `(num_logical_blocks, scheduler_block_size, 1, page_bytes / scheduler_block_size)`
 (format 17, `NL_X_NP_X_NB_BS_ONE_HS`, when the edit wraps it in a one-element
-list). The fused rank-4/5 rule is registered before the plane rules; among
+list). The singleton head on axis 2 is synthetic: format 17 consumers treat the
+plane as opaque logical-page bytes and must not perform head-aware or
+content-aware processing. The fused rank-4/5 rule is registered before the plane rules; among
 those, the interleaved rule is registered first. A pair that matches neither
 layout is left unchanged. Matching uses strides and contiguity, not the
 vLLM-Ascend version string — the table rows are the layouts those releases
