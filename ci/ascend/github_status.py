@@ -6,16 +6,31 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 STATUS_CONTEXT = "Ascend NPU"
+_GITHUB_AUTH_SCHEME = "Bearer"
+
+
+def _authorization_header(github_token: str) -> dict[str, str]:
+    """Build GitHub REST Authorization header from a runtime credential."""
+    value = f"{_GITHUB_AUTH_SCHEME} {github_token.strip()}"
+    return {"Authorization": value}
+
+
+def _github_token_from_env() -> str:
+    credential = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not credential:
+        raise RuntimeError("GITHUB_TOKEN must be set in the environment")
+    return credential
 
 
 def post_status(
     *,
-    token: str,
+    github_token: str,
     owner: str,
     repo: str,
     sha: str,
@@ -34,17 +49,13 @@ def post_status(
     if target_url:
         body["target_url"] = target_url
     data = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "lmcache-ascend-jenkins",
-        },
-    )
+    headers = {
+        **_authorization_header(github_token),
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "lmcache-ascend-jenkins",
+    }
+    request = urllib.request.Request(url, data=data, method="POST", headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
         if response.status not in (200, 201):
             raise RuntimeError(f"unexpected status {response.status}")
@@ -52,7 +63,6 @@ def post_status(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--token", default=None, help="GitHub token (or GITHUB_TOKEN)")
     parser.add_argument("--owner", default="LMCache")
     parser.add_argument("--repo", default="LMCache")
     parser.add_argument("--sha", required=True)
@@ -60,13 +70,14 @@ def main() -> int:
     parser.add_argument("--description", required=True)
     parser.add_argument("--target-url", default=None)
     args = parser.parse_args()
-    token = args.token or __import__("os").environ.get("GITHUB_TOKEN")
-    if not token:
-        print("GITHUB_TOKEN or --token required", file=sys.stderr)
+    try:
+        github_token = _github_token_from_env()
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
         return 2
     try:
         post_status(
-            token=token,
+            github_token=github_token,
             owner=args.owner,
             repo=args.repo,
             sha=args.sha,

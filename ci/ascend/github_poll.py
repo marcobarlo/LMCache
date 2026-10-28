@@ -18,29 +18,30 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-from github_status import post_status  # noqa: E402
+from github_status import _authorization_header, post_status  # noqa: E402
 
 NPU_LABEL = "npu"
 BASE_BRANCHES = ("dev",)
 
 
 def _request(
-    token: str,
+    github_token: str,
     method: str,
     url: str,
     body: dict | None = None,
 ) -> object:
     data = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {
+        **_authorization_header(github_token),
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "lmcache-ascend-jenkins-poll",
+    }
     req = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "lmcache-ascend-jenkins-poll",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -171,7 +172,6 @@ def main() -> int:
     parser.add_argument("--jenkins-job", default="lmcache-ascend-pr")
     parser.add_argument("--jenkins-user", default=os.environ.get("JENKINS_USER"))
     parser.add_argument("--jenkins-token", default=os.environ.get("JENKINS_TOKEN"))
-    parser.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"))
     parser.add_argument(
         "--state-file",
         type=Path,
@@ -180,8 +180,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if not args.github_token:
-        print("GITHUB_TOKEN required", file=sys.stderr)
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not github_token:
+        print("GITHUB_TOKEN must be set in the environment", file=sys.stderr)
         return 2
     if not args.dry_run and (not args.jenkins_user or not args.jenkins_token):
         print("JENKINS_USER and JENKINS_TOKEN required", file=sys.stderr)
@@ -189,7 +190,7 @@ def main() -> int:
 
     repo_root = args.repo_root.resolve()
     state = load_state(args.state_file)
-    pulls = list_open_prs(args.github_token, args.owner, args.repo)
+    pulls = list_open_prs(github_token, args.owner, args.repo)
 
     for pr in pulls:
         number = int(pr["number"])
@@ -198,7 +199,7 @@ def main() -> int:
         key = f"pr-{number}"
         if state.get(key) == head_sha:
             continue
-        if not pr_is_eligible(args.github_token, args.owner, args.repo, pr):
+        if not pr_is_eligible(github_token, args.owner, args.repo, pr):
             continue
 
         for ref in (base_sha, head_sha):
@@ -215,7 +216,7 @@ def main() -> int:
             continue
         if not paths:
             post_status(
-                token=args.github_token,
+                github_token=github_token,
                 owner=args.owner,
                 repo=args.repo,
                 sha=head_sha,
@@ -230,7 +231,7 @@ def main() -> int:
             continue
 
         post_status(
-            token=args.github_token,
+            github_token=github_token,
             owner=args.owner,
             repo=args.repo,
             sha=head_sha,
@@ -252,7 +253,7 @@ def main() -> int:
         except urllib.error.HTTPError as err:
             print(err.read().decode(), file=sys.stderr)
             post_status(
-                token=args.github_token,
+                github_token=github_token,
                 owner=args.owner,
                 repo=args.repo,
                 sha=head_sha,
