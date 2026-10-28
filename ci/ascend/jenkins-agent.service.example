@@ -1,0 +1,31 @@
+# Example systemd unit for a Jenkins inbound agent on an Ascend 910B host.
+# Copy to /etc/systemd/system/jenkins-agent.service and edit paths/secrets.
+#
+# Controller URL must be reachable from this host (intranet only).
+# Agent connects outbound; no inbound firewall rule from the internet.
+
+[Unit]
+Description=Jenkins inbound agent (Ascend 910B)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jenkins
+Group=jenkins
+WorkingDirectory=/var/lib/jenkins-agent
+Environment=JENKINS_URL=https://jenkins.example.corp/
+Environment=JENKINS_SECRET=<agent-secret-from-controller>
+Environment=JENKINS_AGENT_NAME=ascend-910b-01
+Environment=JENKINS_WEB_SOCKET=true
+ExecStart=/usr/bin/java -jar /var/lib/jenkins-agent/agent.jar \
+  -url ${JENKINS_URL} \
+  -secret ${JENKINS_SECRET} \
+  -name ${JENKINS_AGENT_NAME} \
+  -webSocket \
+  -workDir /var/lib/jenkins-agent
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

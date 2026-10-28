@@ -174,6 +174,16 @@ By default, all tests found within the tests directory are run. However, specifi
 
     Some unit tests require a NVIDIA GPU. This means that on a non Linux NVIDIA GPU system, the full suite of tests will not be run (tests requiring CUDA will be skipped). The Buildkite continuous integration (CI)  system executes a full run of all the tests.
 
+Ascend NPU hardware (Jenkins)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+LMCache upstream runs Ascend tests on company 910B hardware through an **intranet Jenkins** controller (not GitHub-hosted runners on public pull requests). See ``ci/ascend/README.md`` in the repository for controller and agent setup.
+
+* **Nightly:** ``dev`` is tested on a schedule with multiprocess and P2P pytest paths (``-m "not cuda"``).
+* **Pull requests:** Hardware runs only after a maintainer adds the **`npu`** label **or** approves the PR with write access. Tests are **path-scoped** from the diff (native/build changes fall back to the nightly list).
+* **GitHub status:** Context name ``Ascend NPU`` (informational; not a required check).
+* **Trust model:** The Jenkinsfile is loaded from trusted ``dev``; the job checks out the PR commit as **source only** for pytest.
+
 .. note::
 
     The `NVIDIA Inference Xfer Library (NIXL) <https://github.com/ai-dynamo/nixl>`_ unit tests require NIXL to be to be installed. This is not installed by LMCache by and therefore requires you to install it separately. Please follow the details in the NIXL GitHub repo to install.
