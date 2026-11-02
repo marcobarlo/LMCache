@@ -196,6 +196,13 @@ _path_filter_should_skip_for_pipeline() {
             fi
             return 1
             ;;
+        ascend)
+            if declare -F "_path_filter_ascend_should_skip" >/dev/null 2>&1; then
+                _path_filter_ascend_should_skip "$changed_file"
+                return $?
+            fi
+            return 1
+            ;;
         musa)
             # Placeholder only: no dedicated MUSA pipeline dir is introduced here.
             # Keep the platform kind explicit for future CI extension.
@@ -234,6 +241,7 @@ _path_filter_pipeline_kind() {
         *k3_tests/musa/pipeline.yml) echo musa ;;
         *k3_tests/rbln/pipeline.yml) echo rbln ;;
         *k3_tests/amd/pipeline.yml) echo amd ;;
+        *k3_tests/ascend/pipeline.yml) echo ascend ;;
         *k3_tests/comprehensive/pipeline.yml) echo comprehensive ;;
         *) echo generic ;;
     esac
@@ -244,7 +252,7 @@ _path_filter_load_device_filter() {
     local script_dir repo_root filter_script
 
     case "$pipeline_kind" in
-        xpu|amd|rbln) ;;
+        xpu|amd|rbln|ascend) ;;
         *) return 0 ;;
     esac
 
