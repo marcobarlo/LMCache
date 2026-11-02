@@ -42,7 +42,8 @@ Optional overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | Container image |
-| `SOC_VERSION` | `Ascend910B4` | Passed into the container |
+| `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE` | `0.0.0+ci` | Editable installs skip git tag lookup (same as MUSA/AMD/harness CI) |
+| `SOC_VERSION` | `Ascend910B4` | Passed into the container; use `Ascend910B3` on 910B3 hosts |
 | `NO_GPU_EXT` | `1` | Skip GPU kernel extensions; common C++ (`lmcache_native`) still builds |
 | `BUILD_WITH_ASCEND` | `1` | Select Ascend build profile (do **not** set `NO_CUDA_EXT=1`; that disables all native code) |
 | `TORCH_DEVICE_BACKEND_AUTOLOAD` | `0` | Required on vLLM-Ascend / PyTorch 2.x so CUDA backends are not auto-loaded on NPU hosts |
@@ -76,10 +77,11 @@ steps:
 
 ## What this pipeline runs
 
-Inside the container:
+Inside the container (as root over a user-owned checkout):
 
+- `git config --global --add safe.directory /workspace/LMCache` (avoids dubious ownership)
+- `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+ci` before `pip install -e .`
 - `pip install -e .` with `BUILD_WITH_ASCEND=1`, `NO_GPU_EXT=1`, and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
-- gRPC stub generation for multiprocess transport tests
 - NPU context init before pytest (avoids `aclrtMallocHost` 107002 on pinned alloc)
 - `pytest` on `tests/v1/multiprocess`, P2P backend and adapter tests, `-m "not cuda"`
 
