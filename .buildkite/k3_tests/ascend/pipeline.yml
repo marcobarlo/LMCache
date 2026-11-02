@@ -1,0 +1,20 @@
+# Ascend 910B NPU pytest lane (multiprocess + P2P).
+
+env:
+  LMCACHE_TRACK_USAGE: "false"
+  SOC_VERSION: "Ascend910B4"
+
+steps:
+  - label: "Ascend NPU Unit Tests (910B)"
+    key: "ascend_npu_unit_tests"
+    timeout_in_minutes: 60
+    concurrency: 1
+    concurrency_group: "lmcache/ascend-910b"
+    command: bash .buildkite/k3_tests/ascend/run-in-container.sh
+
+    agents:
+      queue: "Ascend910B"
+
+    artifact_paths:
+      - "ascend-junit.xml"
+      - "ascend-ci-artifacts/**/*"
