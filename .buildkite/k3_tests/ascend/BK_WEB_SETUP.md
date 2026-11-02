@@ -43,7 +43,8 @@ Optional overrides:
 |----------|---------|---------|
 | `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | Container image |
 | `SOC_VERSION` | `Ascend910B4` | Passed into the container |
-| `NO_CUDA_EXT` | `1` | Set on `docker run` and before `pip install -e .` (no CUDA extension build) |
+| `NO_GPU_EXT` | `1` | Skip GPU kernel extensions; common C++ (`lmcache_native`) still builds |
+| `BUILD_WITH_ASCEND` | `1` | Select Ascend build profile (do **not** set `NO_CUDA_EXT=1`; that disables all native code) |
 | `TORCH_DEVICE_BACKEND_AUTOLOAD` | `0` | Required on vLLM-Ascend / PyTorch 2.x so CUDA backends are not auto-loaded on NPU hosts |
 | `ASCEND_CI_ARTIFACT_DIR` | `ascend-ci-artifacts` | Host directory for logs and JUnit |
 | `ASCEND_CI_PROXY_HOST` | `host.docker.internal:3128` | HTTP proxy when `proxyhk.huawei.com` resolves |
@@ -77,7 +78,7 @@ steps:
 
 Inside the container:
 
-- `pip install -e .` with `NO_CUDA_EXT=1` and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+- `pip install -e .` with `BUILD_WITH_ASCEND=1`, `NO_GPU_EXT=1`, and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
 - gRPC stub generation for multiprocess transport tests
 - NPU context init before pytest (avoids `aclrtMallocHost` 107002 on pinned alloc)
 - `pytest` on `tests/v1/multiprocess`, P2P backend and adapter tests, `-m "not cuda"`
