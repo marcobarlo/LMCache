@@ -127,3 +127,11 @@ sequenceDiagram
 - This lane does **not** run the old intranet-only **Jenkins** `github_status.py` path; status flows **Buildkite → GitHub** when the pipeline is linked to the repo.
 
 See also: [`BK_WEB_SETUP.md`](BK_WEB_SETUP.md), [`run-in-container.sh`](run-in-container.sh).
+
+## Verification PR (fork)
+
+To exercise this lane on a self-hosted **`Ascend910B`** agent:
+
+1. Open a PR into **`dev`** from branch **`ci/test-ascend-trigger`** (or any branch that includes `.buildkite/k3_tests/ascend/`).
+2. Add GitHub label **`npu`** (or **`full`**) on the PR.
+3. Confirm Buildkite runs pipeline **`lmcache-ascend-910b`** (upload step + Ascend pytest on queue **`Ascend910B`**).
