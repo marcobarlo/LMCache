@@ -3,6 +3,7 @@
 env:
   LMCACHE_TRACK_USAGE: "false"
   SOC_VERSION: "Ascend910B4"
+  LMCACHE_ASCEND_CHECKOUT_PATH: "/var/lib/jenkins/lmcache-ascend-ci"
 
 steps:
   - label: "Ascend NPU Unit Tests (910B)"

@@ -44,7 +44,7 @@ Optional overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | Container image |
-| `LMCACHE_ASCEND_CHECKOUT_PATH` | _(auto-clone)_ | Host path to an existing **LMCache-Ascend** git checkout (with submodules). If unset, cloned under `ascend-ci-artifacts/LMCache-Ascend`. |
+| `LMCACHE_ASCEND_CHECKOUT_PATH` | `/var/lib/jenkins/lmcache-ascend-ci` | Host path to **LMCache-Ascend** git checkout (with submodules); set in `pipeline.yml` for agents |
 | `LMCACHE_ASCEND_REF` | `main` | Branch/tag/SHA for the plugin when cloning |
 | `LMCACHE_ASCEND_REPO` | `git@github.com:LMCache/LMCache-Ascend.git` | Plugin remote used for auto-clone |
 | `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE` | `0.0.0+ci` | Editable LMCache install skips git tag lookup (same as MUSA/AMD/harness CI) |
