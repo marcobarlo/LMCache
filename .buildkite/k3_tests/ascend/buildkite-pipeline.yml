@@ -1,0 +1,10 @@
+# Paste this into the Ascend910B Buildkite pipeline's "Steps" editor.
+# It uploads the NPU hardware pytest definition from the repo on the
+# maintainer's Ascend910B queue.
+
+agents:
+  queue: "Ascend910B"
+
+steps:
+  - label: ":pipeline: Upload pipeline"
+    command: bash .buildkite/k3_tests/common_scripts/upload-pipeline.sh .buildkite/k3_tests/ascend/pipeline.yml
