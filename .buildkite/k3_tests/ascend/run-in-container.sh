@@ -40,6 +40,7 @@ cd /workspace/LMCache
 export SOC_VERSION="${SOC_VERSION}"
 export NO_CUDA_EXT=1
 export NO_GPU_EXT=1
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export LMCACHE_TRACK_USAGE=false
 export PYTHONHASHSEED=0
 export PYTHONPATH="/tmp/pytest_site:\${PYTHONPATH:-}"
@@ -62,6 +63,11 @@ python3 -m lmcache.v1.multiprocess.transport.grpc_impl._proto_gen._generate
 mkdir -p /tmp/pytest_site
 cat > /tmp/pytest_site/sitecustomize.py <<'PYEOF'
 import torch
+
+try:
+    import torch_npu  # noqa: F401 — required when TORCH_DEVICE_BACKEND_AUTOLOAD=0
+except ImportError:
+    pass
 
 if getattr(torch, "npu", None) is not None and torch.npu.is_available():
     torch.npu.set_device(0)
@@ -92,6 +98,10 @@ DOCKER_OPTS=(
     --user root
     --cap-add=SYS_PTRACE
     --label "owner=lmcache-buildkite-ascend"
+    -e "NO_CUDA_EXT=1"
+    -e "NO_GPU_EXT=1"
+    -e "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
+    -e "SOC_VERSION=${SOC_VERSION}"
     -v "${REPO_ROOT}:/workspace/LMCache:rw"
     -v "${INNER}:/tmp/run_pytest_inner.sh:ro"
     -v "${ARTIFACT_DIR}:/ascend-ci-artifacts"
