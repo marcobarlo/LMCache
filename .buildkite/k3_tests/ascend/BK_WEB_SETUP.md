@@ -42,7 +42,11 @@ Optional overrides:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | Container image |
-| `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE` | `0.0.0+ci` | Editable installs skip git tag lookup (same as MUSA/AMD/harness CI) |
+| `LMCACHE_ASCEND_CHECKOUT_PATH` | _(auto-clone)_ | Host path to an existing **LMCache-Ascend** git checkout (with submodules). If unset, cloned under `ascend-ci-artifacts/LMCache-Ascend`. |
+| `LMCACHE_ASCEND_REF` | `main` | Branch/tag/SHA for the plugin when cloning |
+| `LMCACHE_ASCEND_REPO` | `git@github.com:LMCache/LMCache-Ascend.git` | Plugin remote used for auto-clone |
+| `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE` | `0.0.0+ci` | Editable LMCache install skips git tag lookup (same as MUSA/AMD/harness CI) |
+| `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE_ASCEND` | `0.0.0+ci` | Editable plugin install skips git tag lookup |
 | `SOC_VERSION` | `Ascend910B4` | Passed into the container; use `Ascend910B3` on 910B3 hosts |
 | `NO_GPU_EXT` | `1` | Skip GPU kernel extensions; common C++ (`lmcache_native`) still builds |
 | `BUILD_WITH_ASCEND` | `1` | Select Ascend build profile (do **not** set `NO_CUDA_EXT=1`; that disables all native code) |
@@ -58,7 +62,8 @@ The self-hosted agent must provide:
 2. Docker access and permission to use Davinci devices from containers.
 3. Devices `/dev/davinci0`, `/dev/davinci1`, `/dev/davinci_manager`, `/dev/devmm_svm`, `/dev/hisi_hdc`.
 4. Read-only mounts of `/usr/local/Ascend/driver`, `/usr/local/dcmi`, and `npu-smi`.
-5. The `buildkite-agent` binary registered to queue **`Ascend910B`** (outbound
+5. **`git`** on the agent (for auto-cloning LMCache-Ascend when `LMCACHE_ASCEND_CHECKOUT_PATH` is unset).
+6. The `buildkite-agent` binary registered to queue **`Ascend910B`** (outbound
    connection to Buildkite; same model as MUSA `MooreThreads` and AMD bare metal).
 
 Install the agent on the intranet host; do not register this machine as a
@@ -79,9 +84,10 @@ steps:
 
 Inside the container (as root over a user-owned checkout):
 
-- `git config --global --add safe.directory /workspace/LMCache` (avoids dubious ownership)
-- `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+ci` before `pip install -e .`
-- `pip install -e .` with `BUILD_WITH_ASCEND=1`, `NO_GPU_EXT=1`, and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+- Mount **LMCache** at `/workspace/LMCache` and **LMCache-Ascend** at `/workspace/LMCache-Ascend`
+- `git config --global --add safe.directory` for both trees (avoids dubious ownership)
+- `pip install -e /workspace/LMCache` then `pip install -e /workspace/LMCache-Ascend` with `BUILD_WITH_ASCEND=1`, `NO_GPU_EXT=1`, `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+- Import check: `lmcache` + `lmcache_ascend`
 - NPU context init before pytest (avoids `aclrtMallocHost` 107002 on pinned alloc)
 - `pytest` on `tests/v1/multiprocess`, P2P backend and adapter tests, `-m "not cuda"`
 
