@@ -37,6 +37,9 @@ cat > "${INNER}" <<EOF
 set -euo pipefail
 cd /workspace/LMCache
 
+git config --global --add safe.directory /workspace/LMCache
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE="\${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE:-0.0.0+ci}"
+
 export SOC_VERSION="${SOC_VERSION}"
 export BUILD_WITH_ASCEND=1
 export NO_GPU_EXT=1
@@ -106,6 +109,7 @@ DOCKER_OPTS=(
     -e "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
     -e "SOC_VERSION=${SOC_VERSION}"
     -e "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}"
+    -e "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE:-0.0.0+ci}"
     -v "${REPO_ROOT}:/workspace/LMCache:rw"
     -v "${INNER}:/tmp/run_pytest_inner.sh:ro"
     -v "${ARTIFACT_DIR}:/ascend-ci-artifacts"
