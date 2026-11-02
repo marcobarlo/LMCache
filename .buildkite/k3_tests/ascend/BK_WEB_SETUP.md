@@ -1,5 +1,7 @@
 # Buildkite Web UI Setup: Ascend 910B NPU Unit Tests
 
+Architecture and **outbound network** from the self-hosted agent: see [`CI_NETWORK.md`](CI_NETWORK.md).
+
 **Steps editor**: paste the contents of `buildkite-pipeline.yml`.
 
 **GitHub trigger settings**:
