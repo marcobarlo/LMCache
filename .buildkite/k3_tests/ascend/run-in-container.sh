@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${BUILDKITE_BUILD_CHECKOUT_PATH:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
-IMAGE="${ASCEND_CI_IMAGE:-quay.io/ascend/vllm-ascend:v0.18.0rc1}"
+IMAGE="${ASCEND_CI_IMAGE:-quay.io/ascend/vllm-ascend:v0.26.0rc1}"
 SOC_VERSION="${SOC_VERSION:-Ascend910B4}"
 PROXY_HOST="${ASCEND_CI_PROXY_HOST:-host.docker.internal:3128}"
 ARTIFACT_PATH="${ASCEND_CI_ARTIFACT_DIR:-ascend-ci-artifacts}"
