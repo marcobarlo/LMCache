@@ -41,7 +41,7 @@ Optional overrides:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.18.0rc1` | Container image |
+| `ASCEND_CI_IMAGE` | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | Container image |
 | `SOC_VERSION` | `Ascend910B4` | Passed into the container |
 | `ASCEND_CI_ARTIFACT_DIR` | `ascend-ci-artifacts` | Host directory for logs and JUnit |
 | `ASCEND_CI_PROXY_HOST` | `host.docker.internal:3128` | HTTP proxy when `proxyhk.huawei.com` resolves |
