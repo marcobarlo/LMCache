@@ -127,3 +127,5 @@ sequenceDiagram
 - This lane does **not** run the old intranet-only **Jenkins** `github_status.py` path; status flows **Buildkite → GitHub** when the pipeline is linked to the repo.
 
 See also: [`BK_WEB_SETUP.md`](BK_WEB_SETUP.md), [`run-in-container.sh`](run-in-container.sh).
+
+<!-- buildkite-ascend-trigger-test: 2026-11-02T15:43Z -->
