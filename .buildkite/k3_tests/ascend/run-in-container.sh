@@ -38,11 +38,12 @@ set -euo pipefail
 cd /workspace/LMCache
 
 export SOC_VERSION="${SOC_VERSION}"
-export NO_CUDA_EXT=1
+export BUILD_WITH_ASCEND=1
 export NO_GPU_EXT=1
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export LMCACHE_TRACK_USAGE=false
 export PYTHONHASHSEED=0
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="/tmp/pytest_site:\${PYTHONPATH:-}"
 
 if getent hosts proxyhk.huawei.com >/dev/null 2>&1; then
@@ -53,9 +54,11 @@ fi
 export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/\$(uname -i)-linux/devlib"
 
 python3 -m pip install -q --upgrade pip
-python3 -m pip install -q -r requirements/test.txt
 python3 -m pip install -q -r requirements/common.txt
-python3 -m pip install -q -r requirements/proto.txt
+python3 -m pip install -q -r requirements/test.txt
+if [[ -f requirements/proto.txt ]]; then
+  python3 -m pip install -q -r requirements/proto.txt
+fi
 python3 -m pip install -q -v --no-build-isolation -e .
 
 python3 -m lmcache.v1.multiprocess.transport.grpc_impl._proto_gen._generate
@@ -77,13 +80,12 @@ PYEOF
 set +e
 python3 -u -m pytest -v \\
   tests/v1/multiprocess \\
-  tests/v1/storage_backend/test_p2p_backend_with_controller.py \\
+  tests/inprocess/v1/storage_backend/test_p2p_backend_with_controller.py \\
   tests/v1/distributed/l2_adapters/test_p2p_l2_adapter.py \\
   -m "not cuda" \\
   --ignore=tests/v1/multiprocess/test_client.py \\
   --ignore=tests/v1/multiprocess/test_grpc_transport.py \\
   -o log_cli=false \\
-  --timeout=180 \\
   --junit-xml=/workspace/LMCache/ascend-junit.xml \\
   --tb=short \\
   -q
@@ -96,12 +98,14 @@ chmod +x "${INNER}"
 DOCKER_OPTS=(
     --rm
     --user root
+    --ipc=host
     --cap-add=SYS_PTRACE
     --label "owner=lmcache-buildkite-ascend"
-    -e "NO_CUDA_EXT=1"
+    -e "BUILD_WITH_ASCEND=1"
     -e "NO_GPU_EXT=1"
     -e "TORCH_DEVICE_BACKEND_AUTOLOAD=0"
     -e "SOC_VERSION=${SOC_VERSION}"
+    -e "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0}"
     -v "${REPO_ROOT}:/workspace/LMCache:rw"
     -v "${INNER}:/tmp/run_pytest_inner.sh:ro"
     -v "${ARTIFACT_DIR}:/ascend-ci-artifacts"
@@ -114,6 +118,10 @@ DOCKER_OPTS=(
     --device /dev/davinci_manager
     --device /dev/hisi_hdc
 )
+
+if [[ -d /etc/pki/ca-trust ]]; then
+    DOCKER_OPTS+=(-v /etc/pki/ca-trust:/etc/pki/ca-trust:ro)
+fi
 
 if getent hosts proxyhk.huawei.com >/dev/null 2>&1; then
     DOCKER_OPTS+=(--add-host=host.docker.internal:192.168.1.1)
