@@ -27,6 +27,7 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import KVCache
 from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.gpu_connector.gds_context import get_gds_context
 
 if TYPE_CHECKING:
     # First Party
@@ -227,6 +228,11 @@ class _TempNpuBuffer:
             for object_group_idx in range(self._kv_groups_manager.num_object_groups)
         )
 
+    @property
+    def buffer(self) -> torch.Tensor:
+        """Return the flat NPU staging allocation for GDS registration."""
+        return self._temp_buffer
+
 
 class NpuCacheContext(BaseCacheContext):
     """Cache context for NPU-backed KV tensors in MP handle mode."""
@@ -258,6 +264,7 @@ class NpuCacheContext(BaseCacheContext):
             ValueError: If reconstructed tensors are not NPU tensors.
         """
         self._ipc_wrappers: tuple[Any, ...] = tuple(kv_caches)
+        self._gds_buffer_registered = False
         try:
             self._initialize(
                 kv_caches,
@@ -350,6 +357,9 @@ class NpuCacheContext(BaseCacheContext):
         self.stream_ = torch_dev.Stream(device=self.device_)
         self.host_callback_stream_ = _NpuHostCallbackStream(self.stream_)
 
+        with torch_dev.stream(self.stream_):
+            self._register_gds_buffer()
+
         logger.debug(
             "NpuCacheContext: %d layers, %d blocks, dtype=%s",
             self.num_layers_,
@@ -357,11 +367,33 @@ class NpuCacheContext(BaseCacheContext):
             self.kv_layer_groups_manager_.kernel_groups[0].dtype,
         )
 
+    def _register_gds_buffer(self) -> None:
+        """Register flat staging memory with the process GDS context on this stream."""
+        with torch_dev.stream(self.stream_):
+            get_gds_context().register_gpu_buffer(self._temp_buffer.buffer)
+        self._gds_buffer_registered = True
+
+    def _deregister_gds_buffer(self) -> None:
+        """Deregister staging memory if this context registered it."""
+        if not self._gds_buffer_registered:
+            return
+        stream = getattr(self, "stream_", None)
+        synchronize = getattr(stream, "synchronize", None)
+        if callable(synchronize):
+            synchronize()
+        try:
+            with torch_dev.stream(self.stream_):
+                get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+        finally:
+            self._gds_buffer_registered = False
+
     def close(self) -> None:
         """Synchronize transfers and release receiver-side IPC owners."""
         wrappers = self._ipc_wrappers
         if not wrappers:
             return
+
+        self._deregister_gds_buffer()
 
         stream = getattr(self, "stream_", None)
         synchronize = getattr(stream, "synchronize", None)
