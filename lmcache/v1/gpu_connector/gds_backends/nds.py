@@ -6,13 +6,13 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 import bisect
 import fcntl
 import os
 import stat
 import struct
-from pathlib import Path
 
 # Third Party
 import torch
@@ -27,6 +27,12 @@ _MAX_GDS_REGION = 16 * 1024 * 1024
 _NDS_SECTOR = 512
 
 FS_IOC_FIEMAP = 0xC020660B
+# struct fiemap is 32 bytes; struct fiemap_extent is 56 (fe_reserved64[2]
+# sits between fe_length and fe_flags). A 40-byte stride under-allocates
+# the ioctl buffer and mis-reads every extent after the first.
+_FIEMAP_HEADER_SIZE = 32
+_FIEMAP_EXTENT_SIZE = 56
+_FIEMAP_FLAG_SYNC = 0x1
 FIEMAP_EXTENT_LAST = 0x00000001
 FIEMAP_EXTENT_UNKNOWN = 0x00000002
 FIEMAP_EXTENT_DELALLOC = 0x00000004
@@ -49,6 +55,8 @@ _UNSUPPORTED_FIEMAP_FLAGS = (
 
 @dataclass(frozen=True)
 class _SlabExtent:
+    """One FIEMAP slice: logical byte range in the slab file and its disk physical range."""
+
     logical: int
     physical: int
     length: int
@@ -57,6 +65,8 @@ class _SlabExtent:
 
 @dataclass
 class _RegisteredRegion:
+    """One <=16 MiB NPU staging slice for bounds checks and optional mem register."""
+
     tensor: torch.Tensor
     base_ptr: int
     nbytes: int
@@ -64,24 +74,39 @@ class _RegisteredRegion:
 
 
 def _fiemap_extents(fd: int, size: int) -> list[_SlabExtent]:
+    """Query ``FS_IOC_FIEMAP`` for ``[0, size)`` on an open slab file fd.
+
+    Returns extents trimmed to the slab size, in ascending logical order until
+    ``FIEMAP_EXTENT_LAST`` or the range is exhausted. Each extent record is
+    the 56-byte ``struct fiemap_extent``; flags live at byte 40 of that record.
+    """
     fm_start = 0
     out: list[_SlabExtent] = []
     while fm_start < size:
-        extent_count = 32
-        buf = bytearray(32 + extent_count * 40)
+        extent_count = 128
+        buf = bytearray(_FIEMAP_HEADER_SIZE + extent_count * _FIEMAP_EXTENT_SIZE)
         query_len = size - fm_start
         struct.pack_into(
-            "<QQIIII", buf, 0, fm_start, query_len, 0, 0, extent_count, 0
+            "<QQIIII",
+            buf,
+            0,
+            fm_start,
+            query_len,
+            _FIEMAP_FLAG_SYNC,
+            0,
+            extent_count,
+            0,
         )
         fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
         _, _, _, mapped, _, _ = struct.unpack_from("<QQIIII", buf, 0)
         if mapped == 0:
             break
+        mapped = min(mapped, extent_count)
         last_logical = fm_start
         for i in range(mapped):
-            logical, physical, length, flags, _, _, _ = struct.unpack_from(
-                "<QQQIIII", buf, 32 + i * 40
-            )
+            base = _FIEMAP_HEADER_SIZE + i * _FIEMAP_EXTENT_SIZE
+            logical, physical, length = struct.unpack_from("<QQQ", buf, base)
+            (flags,) = struct.unpack_from("<I", buf, base + 40)
             if logical + length <= 0 or length == 0:
                 continue
             if logical >= size:
@@ -100,7 +125,9 @@ def _fiemap_extents(fd: int, size: int) -> list[_SlabExtent]:
             )
             last_logical = max(last_logical, logical + length)
             if flags & FIEMAP_EXTENT_LAST:
-                return out
+                if last_logical >= size:
+                    return out
+                break
         if last_logical <= fm_start:
             break
         fm_start = last_logical
@@ -108,6 +135,7 @@ def _fiemap_extents(fd: int, size: int) -> list[_SlabExtent]:
 
 
 def _validate_slab_extents(extents: list[_SlabExtent], size: int) -> None:
+    """Reject slabs NDS store cannot use: gaps, short coverage, alignment, bad flags."""
     if not extents:
         raise ValueError("NDS slab has no FIEMAP extents")
     pos = 0
@@ -117,20 +145,25 @@ def _validate_slab_extents(extents: list[_SlabExtent], size: int) -> None:
                 f"NDS slab extents have a gap at byte {pos} (got logical {ext.logical})"
             )
         if ext.length <= 0 or ext.length % _NDS_SECTOR:
-            raise ValueError(f"NDS extent length must be a positive multiple of 512: {ext}")
+            raise ValueError(
+                f"NDS extent length must be a positive multiple of 512: {ext}"
+            )
         if ext.physical <= 0 or ext.physical % _NDS_SECTOR:
             raise ValueError(
                 f"NDS extent physical offset must be a positive multiple of 512: {ext}"
             )
         bad = ext.flags & _UNSUPPORTED_FIEMAP_FLAGS
         if bad:
-            raise ValueError(f"NDS extent has unsupported FIEMAP flags 0x{bad:x}: {ext}")
+            raise ValueError(
+                f"NDS extent has unsupported FIEMAP flags 0x{bad:x}: {ext}"
+            )
         pos += ext.length
     if pos < size:
         raise ValueError(f"NDS slab extents cover {pos} bytes, need {size}")
 
 
 def _block_device_path_for_file(path: str) -> str:
+    """Return ``/dev/...`` for the block device that hosts a file (``st_dev`` match)."""
     dev = os.stat(path).st_dev
     for node in Path("/dev").iterdir():
         try:
@@ -161,7 +194,8 @@ class Backend(FileGDSBackend):
 
     @classmethod
     def is_default(cls) -> bool:
-        return False
+        npu = getattr(torch, "npu", None)
+        return npu is not None and npu.is_available()
 
     def validate_environment(self) -> None:
         npu = getattr(torch, "npu", None)
@@ -170,18 +204,14 @@ class Backend(FileGDSBackend):
         if not npu.is_available():
             raise ValueError("nds backend requires an available NPU")
 
-    def _library(self):
-        from lmcache_ascend.v1.gds.nds_library import get_nds_library
-
-        return get_nds_library()
-
-    def _open_driver(self) -> None:
-        self._library().driver_open()
-
-    def _close_driver(self) -> None:
-        self._library().driver_close()
-
     def open_slab(self, location: str, size: int, direct_io: bool) -> GDSHandle:
+        """Create the slab file for load, then attach block-device store metadata.
+
+        Records ``size`` on the backend, delegates file creation to
+        :class:`FileGDSBackend`, and calls :meth:`NDSHandle.attach_store_device`
+        so reads use the file fd and writes use FIEMAP physical offsets on the
+        backing block device.
+        """
         self._slab_size_bytes = size
         handle = super().open_slab(location, size, direct_io)
         if not isinstance(handle, NDSHandle):
@@ -211,6 +241,7 @@ class Backend(FileGDSBackend):
         self._library().file_deregister(handle)
 
     def register_buffer(self, buf: torch.Tensor) -> None:
+        """Register NPU staging memory in <=16 MiB regions; libnds when required."""
         if buf.device.type != "npu":
             raise ValueError("register_buffer: tensor must be on NPU")
         if not buf.is_contiguous():
@@ -240,18 +271,25 @@ class Backend(FileGDSBackend):
         except BaseException:
             for reg in reversed(inserted):
                 idx = bisect.bisect_left(self._region_base_ptrs, reg.base_ptr)
-                if idx < len(self._region_base_ptrs) and self._region_base_ptrs[idx] == reg.base_ptr:
+                if (
+                    idx < len(self._region_base_ptrs)
+                    and self._region_base_ptrs[idx] == reg.base_ptr
+                ):
                     self._region_base_ptrs.pop(idx)
                     self._regions.pop(idx)
             raise
 
     def deregister_buffer(self, buf: torch.Tensor) -> None:
+        """Reverse :meth:`register_buffer` for each 16 MiB region base in ``buf``."""
         view = buf.view(torch.uint8)
         for start in range(0, view.numel(), _MAX_GDS_REGION):
             region = view[start : min(start + _MAX_GDS_REGION, view.numel())]
             base = region.data_ptr()
             idx = bisect.bisect_left(self._region_base_ptrs, base)
-            if idx >= len(self._region_base_ptrs) or self._region_base_ptrs[idx] != base:
+            if (
+                idx >= len(self._region_base_ptrs)
+                or self._region_base_ptrs[idx] != base
+            ):
                 continue
             region = self._regions[idx]
             caps = self._library().capabilities()
@@ -267,6 +305,7 @@ class Backend(FileGDSBackend):
         self._registered_streams.discard(raw_stream)
 
     def _bind_or_validate_device(self, device_index: int) -> None:
+        """Pin this backend to a single NPU index for the process lifetime."""
         if self._bound_device_index is None:
             self._bound_device_index = device_index
             return
@@ -288,6 +327,7 @@ class Backend(FileGDSBackend):
         buf_offset: int,
         alignment: int = _GDS_ALIGNMENT,
     ) -> None:
+        """Check GDS alignment, slab span, and registered NPU region before I/O."""
         if size <= 0:
             raise ValueError("I/O size must be positive")
         if file_offset < 0 or buf_offset < 0:
@@ -312,6 +352,17 @@ class Backend(FileGDSBackend):
             return
         torch.npu.synchronize()
 
+    def _library(self):
+        from lmcache_ascend.v1.gds.nds_library import get_nds_library
+
+        return get_nds_library()
+
+    def _open_driver(self) -> None:
+        self._library().driver_open()
+
+    def _close_driver(self) -> None:
+        self._library().driver_close()
+
 
 class NDSHandle(FDGDSHandle):
     """Owning NDS file handle with synchronous direct read/write."""
@@ -334,7 +385,14 @@ class NDSHandle(FDGDSHandle):
         self._dev_path = ""
 
     def attach_store_device(self, backend: Backend, slab_size: int) -> None:
-        """Map slab extents and register the backing block device for store."""
+        """Prepare NDS store: FIEMAP map, block ``/dev`` open, and ``nds_register_fs``.
+
+        Load path keeps using the slab **file** fd registered in ``open_handle``.
+        Store path issues ``PWRITE`` on a separate **block device** fd at each
+        extent's physical byte offset (logical ``file_offset`` is translated via
+        :meth:`_write_segments`). On ``register_handle`` failure the block fd is
+        closed; the file handle is unchanged (see :meth:`Backend.open_slab`).
+        """
         self._slab_size = slab_size
         self._extents = _fiemap_extents(self._fd, slab_size)
         _validate_slab_extents(self._extents, slab_size)
@@ -368,6 +426,14 @@ class NDSHandle(FDGDSHandle):
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
+        """GDS ``read_async`` contract; libnds I/O runs synchronously before return.
+
+        :meth:`GDSContext.transfer_async` still treats completion as stream-ordered:
+        this method waits for prior work on ``raw_stream`` (``torch.npu.synchronize``),
+        blocks until ``nds_io_submit`` / ``getevents`` finish the read into registered
+        HBM, then returns a :class:`Submission` with ``bytes_done`` already set.
+        There is no in-flight NDS request after return.
+        """
         return self._run_sync_io(
             "read",
             buf_base,
@@ -385,6 +451,13 @@ class NDSHandle(FDGDSHandle):
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
+        """GDS ``write_async`` contract; libnds store runs synchronously before return.
+
+        Logical ``file_offset`` is mapped to physical device offsets (possibly split
+        across FIEMAP extents). Same stream ordering as :meth:`read_async`: prior
+        NPU work on ``raw_stream`` is drained, then blocking ``PWRITE`` on the
+        registered block-device fd completes before ``Submission`` is returned.
+        """
         caps = self._backend._library().capabilities()
         if not caps.can_write:
             raise RuntimeError("NDS write is not available on this platform")
@@ -399,21 +472,69 @@ class NDSHandle(FDGDSHandle):
         )
 
     def _ensure_extents_initialized(self, file_offset: int, size: int) -> None:
+        """Allocate unwritten extents without leaving dirty zeros in the page cache.
+
+        A buffered ``pwrite`` of zeros marks those pages dirty. The later NDS
+        store writes the real bytes to the block device and bypasses that cache,
+        so writeback of the zeros would overwrite the stored KV. ``O_DIRECT``
+        zero-fill allocates the blocks and leaves the page cache clean.
+        """
         end = file_offset + size
         pos = file_offset
-        touched = False
+        spans: list[tuple[int, int]] = []
         while pos < end:
             ext = self._extent_at(pos)
             seg_end = min(end, ext.logical + ext.length)
             if ext.flags & FIEMAP_EXTENT_UNWRITTEN:
-                length = seg_end - pos
-                os.pwrite(self._fd, b"\x00" * length, pos)
-                touched = True
+                spans.append((pos, seg_end - pos))
             pos = seg_end
-        if touched:
-            os.fsync(self._fd)
-            self._extents = _fiemap_extents(self._fd, self._slab_size)
-            _validate_slab_extents(self._extents, self._slab_size)
+        if not spans:
+            return
+        # Anonymous mmap is page-aligned. os.pwrite may copy and break
+        # O_DIRECT alignment, so the write goes through libc.pwrite.
+        import ctypes
+        import mmap
+
+        chunk = 1024 * 1024
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.pwrite.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int64,
+        ]
+        libc.pwrite.restype = ctypes.c_ssize_t
+        direct_fd = os.open(self.path, os.O_RDWR | os.O_DIRECT)
+        try:
+            buf = mmap.mmap(-1, chunk, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            view = ctypes.c_char.from_buffer(buf)
+            try:
+                addr = ctypes.c_void_p(ctypes.addressof(view))
+                for offset, length in spans:
+                    if offset % _NDS_SECTOR or length % _NDS_SECTOR:
+                        raise ValueError(
+                            f"NDS zero-fill range is not 512-byte aligned: "
+                            f"offset={offset} length={length}"
+                        )
+                    done = 0
+                    while done < length:
+                        n = min(chunk, length - done)
+                        wrote = libc.pwrite(direct_fd, addr, n, offset + done)
+                        if wrote < 0:
+                            err = ctypes.get_errno()
+                            raise OSError(err, os.strerror(err), self.path)
+                        if wrote != n:
+                            raise OSError(
+                                f"short O_DIRECT zero-fill: {wrote} of {n} at {offset + done}"
+                            )
+                        done += wrote
+            finally:
+                del view
+                buf.close()
+        finally:
+            os.close(direct_fd)
+        self._extents = _fiemap_extents(self._fd, self._slab_size)
+        _validate_slab_extents(self._extents, self._slab_size)
 
     def _extent_at(self, logical_offset: int) -> _SlabExtent:
         for ext in self._extents:
@@ -468,6 +589,9 @@ class NDSHandle(FDGDSHandle):
                 )
             done_total += seg_len
             cursor += seg_len
+        # Drop any cached file pages for this range so a later read cannot
+        # observe the pre-DMA contents. Pages are clean after the O_DIRECT fill.
+        os.posix_fadvise(self._fd, file_offset, size, os.POSIX_FADV_DONTNEED)
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         sub.result.value = done_total
         return sub
@@ -486,13 +610,9 @@ class NDSHandle(FDGDSHandle):
         self._backend.synchronize_for_stream(raw_stream)
         lib = self._backend._library()
         if operation == "read":
-            done = lib.read(
-                self._handle, buf_base, size, file_offset, buf_offset
-            )
+            done = lib.read(self._handle, buf_base, size, file_offset, buf_offset)
         else:
-            done = lib.write(
-                self._handle, buf_base, size, file_offset, buf_offset
-            )
+            done = lib.write(self._handle, buf_base, size, file_offset, buf_offset)
         if done != size:
             raise RuntimeError(
                 f"NDS {operation} short I/O: got {done} bytes, expected {size}"

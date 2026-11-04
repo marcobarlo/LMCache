@@ -118,6 +118,7 @@ def test_existing_backend_restrictions_are_preserved(
 ) -> None:
     monkeypatch.setattr(torch.version, "cuda", cuda_version)
     monkeypatch.setattr(torch.version, "hip", hip_version)
+    monkeypatch.setattr(torch, "npu", None, raising=False)
     with pytest.raises(ValueError, match=error):
         create_backend(name)
 

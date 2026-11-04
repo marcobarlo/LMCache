@@ -24,6 +24,18 @@ def test_create_backend_nds_requires_npu(monkeypatch):
         create_backend("nds")
 
 
+def test_nds_is_default_when_npu_available(monkeypatch):
+    npu = MagicMock()
+    npu.is_available.return_value = True
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    assert Backend.is_default()
+
+
+def test_nds_is_not_default_without_npu(monkeypatch):
+    monkeypatch.setattr(torch, "npu", None, raising=False)
+    assert not Backend.is_default()
+
+
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
 def test_backend_open_handle_closes_fd_on_register_failure(mock_library):
     mock_library.return_value.file_register.side_effect = RuntimeError("register")
