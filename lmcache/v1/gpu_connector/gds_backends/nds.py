@@ -5,14 +5,17 @@
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import bisect
+import ctypes
 import fcntl
 import os
 import stat
 import struct
+import threading
 
 # Third Party
 import torch
@@ -32,6 +35,77 @@ FS_IOC_FIEMAP = 0xC020660B
 # the ioctl buffer and mis-reads every extent after the first.
 _FIEMAP_HEADER_SIZE = 32
 _FIEMAP_EXTENT_SIZE = 56
+
+
+def _sync_transfer_stream(raw_stream: int) -> None:
+    """Wait on one ``aclrtStream`` before NDS I/O (stream-scoped, not device-wide)."""
+    from lmcache.v1.platform.devices.npu.device_ops import (
+        _synchronize_npu_stream_pointer,
+    )
+
+    _synchronize_npu_stream_pointer(raw_stream)
+
+
+def _failure_result(exc: BaseException) -> int:
+    """Map an exception to a negative ``Submission.result`` for deferred I/O."""
+    if isinstance(exc, OSError) and exc.errno is not None:
+        return -int(exc.errno)
+    return -1
+
+
+_ACL_HOST_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+_ACL_RT_LIB: ctypes.CDLL | None = None
+_NDS_HOST_CALLBACK_REFS: list[_ACL_HOST_FUNC] = []
+
+
+def _acl_rt_library() -> ctypes.CDLL:
+    """Lazy ``libascendcl`` handle for ``aclrtLaunchHostFunc``."""
+    global _ACL_RT_LIB
+    if _ACL_RT_LIB is None:
+        lib = ctypes.CDLL("libascendcl.so")
+        lib.aclrtLaunchHostFunc.argtypes = [
+            ctypes.c_void_p,
+            _ACL_HOST_FUNC,
+            ctypes.c_void_p,
+        ]
+        lib.aclrtLaunchHostFunc.restype = ctypes.c_int
+        _ACL_RT_LIB = lib
+    return _ACL_RT_LIB
+
+
+def _launch_nds_host_callback(raw_stream: int, callback: Callable[[], None]) -> None:
+    """Enqueue ``callback`` on the current NPU stream after prior stream work."""
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        raise RuntimeError("nds I/O requires torch.npu")
+    stream = npu.current_stream()
+    handle = getattr(stream, "npu_stream", None)
+    if not isinstance(handle, int) or handle != raw_stream:
+        current = handle if isinstance(handle, int) else 0
+        raise RuntimeError(
+            f"NDS I/O must run on the current NPU stream "
+            f"(registered 0x{raw_stream:x}, current 0x{current:x})"
+        )
+    launch_host_func = getattr(stream, "launch_host_func", None)
+    if callable(launch_host_func):
+        launch_host_func(callback)
+        return
+
+    @_ACL_HOST_FUNC
+    def trampoline(_arg: int) -> None:
+        callback()
+
+    _NDS_HOST_CALLBACK_REFS.append(trampoline)
+    err = _acl_rt_library().aclrtLaunchHostFunc(
+        ctypes.c_void_p(raw_stream),
+        trampoline,
+        None,
+    )
+    if int(err) != 0:
+        _NDS_HOST_CALLBACK_REFS.pop()
+        raise RuntimeError(f"aclrtLaunchHostFunc failed with error {err}")
+
+
 _FIEMAP_FLAG_SYNC = 0x1
 FIEMAP_EXTENT_LAST = 0x00000001
 FIEMAP_EXTENT_UNKNOWN = 0x00000002
@@ -191,6 +265,7 @@ class Backend(FileGDSBackend):
         self._regions: list[_RegisteredRegion] = []
         self._region_base_ptrs: list[int] = []
         self._slab_size_bytes: int = 0
+        self._io_submit_lock = threading.Lock()
 
     @classmethod
     def is_default(cls) -> bool:
@@ -346,11 +421,11 @@ class Backend(FileGDSBackend):
             raise RuntimeError("buffer I/O exceeds registered region")
 
     def synchronize_for_stream(self, raw_stream: int) -> None:
-        """Wait for NPU work on the registered stream before synchronous NDS I/O."""
+        """Wait for prior work on the registered transfer stream before NDS I/O."""
         self._validate_stream(raw_stream)
-        if not torch.npu.is_available():
+        if not getattr(torch, "npu", None) or not torch.npu.is_available():
             return
-        torch.npu.synchronize()
+        _sync_transfer_stream(raw_stream)
 
     def _library(self):
         from lmcache_ascend.v1.gds.nds_library import get_nds_library
@@ -365,7 +440,7 @@ class Backend(FileGDSBackend):
 
 
 class NDSHandle(FDGDSHandle):
-    """Owning NDS file handle with synchronous direct read/write."""
+    """Owning NDS file handle with stream-ordered direct read/write."""
 
     def __init__(
         self,
@@ -383,6 +458,43 @@ class NDSHandle(FDGDSHandle):
         self._dev_fd = -1
         self._dev_handle: Any = None
         self._dev_path = ""
+        self._callback_inflight = 0
+        self._callback_lock = threading.Lock()
+        self._callback_done = threading.Condition(self._callback_lock)
+
+    def _begin_callback(self) -> None:
+        with self._callback_lock:
+            self._callback_inflight += 1
+
+    def _end_callback(self) -> None:
+        with self._callback_lock:
+            self._callback_inflight -= 1
+            self._callback_done.notify_all()
+
+    def _wait_callbacks(self) -> None:
+        with self._callback_lock:
+            while self._callback_inflight > 0:
+                self._callback_done.wait()
+
+    def _enqueue_host_io(
+        self,
+        raw_stream: int,
+        sub: Submission,
+        io_fn: Callable[[], int],
+    ) -> Submission:
+        self._begin_callback()
+
+        def host_work() -> None:
+            try:
+                with self._backend._io_submit_lock:
+                    sub.result.value = io_fn()
+            except BaseException as exc:
+                sub.result.value = _failure_result(exc)
+            finally:
+                self._end_callback()
+
+        _launch_nds_host_callback(raw_stream, host_work)
+        return sub
 
     def attach_store_device(self, backend: Backend, slab_size: int) -> None:
         """Prepare NDS store: FIEMAP map, block ``/dev`` open, and ``nds_register_fs``.
@@ -407,6 +519,7 @@ class NDSHandle(FDGDSHandle):
         self._dev_handle = dev_handle
 
     def close(self) -> None:
+        self._wait_callbacks()
         if self._dev_fd >= 0:
             dev_fd = self._dev_fd
             dev_handle = self._dev_handle
@@ -426,22 +539,26 @@ class NDSHandle(FDGDSHandle):
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
-        """GDS ``read_async`` contract; libnds I/O runs synchronously before return.
+        """GDS ``read_async`` contract; libnds I/O runs in a stream host callback.
 
-        :meth:`GDSContext.transfer_async` still treats completion as stream-ordered:
-        this method waits for prior work on ``raw_stream`` (``torch.npu.synchronize``),
-        blocks until ``nds_io_submit`` / ``getevents`` finish the read into registered
-        HBM, then returns a :class:`Submission` with ``bytes_done`` already set.
-        There is no in-flight NDS request after return.
+        Returns a :class:`Submission` immediately. ``bytes_done`` is zero until
+        the callback finishes ``nds_io_submit`` / ``getevents``. Later work
+        queued on the same stream runs after the callback.
         """
-        return self._run_sync_io(
-            "read",
-            buf_base,
-            size,
-            file_offset,
-            buf_offset,
-            raw_stream,
-        )
+        self._backend._validate_stream(raw_stream)
+        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
+        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+
+        def io_fn() -> int:
+            lib = self._backend._library()
+            done = lib.read(self._handle, buf_base, size, file_offset, buf_offset)
+            if done != size:
+                raise RuntimeError(
+                    f"NDS read short I/O: got {done} bytes, expected {size}"
+                )
+            return size
+
+        return self._enqueue_host_io(raw_stream, sub, io_fn)
 
     def write_async(
         self,
@@ -451,25 +568,44 @@ class NDSHandle(FDGDSHandle):
         buf_offset: int,
         raw_stream: int,
     ) -> Submission:
-        """GDS ``write_async`` contract; libnds store runs synchronously before return.
+        """GDS ``write_async`` contract; libnds store runs in a stream host callback.
 
-        Logical ``file_offset`` is mapped to physical device offsets (possibly split
-        across FIEMAP extents). Same stream ordering as :meth:`read_async`: prior
-        NPU work on ``raw_stream`` is drained, then blocking ``PWRITE`` on the
-        registered block-device fd completes before ``Submission`` is returned.
+        Logical ``file_offset`` is mapped to physical device offsets on the caller.
+        ``bytes_done`` is zero until the callback completes all extent ``PWRITE``s.
         """
         caps = self._backend._library().capabilities()
         if not caps.can_write:
             raise RuntimeError("NDS write is not available on this platform")
         if self._dev_fd < 0:
             raise RuntimeError("NDS store device is not open on this handle")
-        return self._run_sync_write(
-            buf_base,
-            size,
-            file_offset,
-            buf_offset,
-            raw_stream,
-        )
+        self._backend._validate_stream(raw_stream)
+        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
+        self._ensure_extents_initialized(file_offset, size)
+        segments = self._write_segments(file_offset, size)
+        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+
+        def io_fn() -> int:
+            lib = self._backend._library()
+            done_total = 0
+            cursor = buf_offset
+            for device_off, seg_len, _logical in segments:
+                done = lib.write(
+                    self._dev_handle,
+                    buf_base,
+                    seg_len,
+                    device_off,
+                    cursor,
+                )
+                if done != seg_len:
+                    raise RuntimeError(
+                        f"NDS write short I/O: got {done} bytes, expected {seg_len}"
+                    )
+                done_total += seg_len
+                cursor += seg_len
+            os.posix_fadvise(self._fd, file_offset, size, os.POSIX_FADV_DONTNEED)
+            return done_total
+
+        return self._enqueue_host_io(raw_stream, sub, io_fn)
 
     def _ensure_extents_initialized(self, file_offset: int, size: int) -> None:
         """Allocate unwritten extents without leaving dirty zeros in the page cache.
@@ -559,64 +695,3 @@ class NDSHandle(FDGDSHandle):
             segments.append((device_off, seg_len, pos))
             pos = seg_end
         return segments
-
-    def _run_sync_write(
-        self,
-        buf_base: int,
-        size: int,
-        file_offset: int,
-        buf_offset: int,
-        raw_stream: int,
-    ) -> Submission:
-        self._backend._validate_stream(raw_stream)
-        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
-        self._backend.synchronize_for_stream(raw_stream)
-        self._ensure_extents_initialized(file_offset, size)
-        lib = self._backend._library()
-        done_total = 0
-        cursor = buf_offset
-        for device_off, seg_len, _logical in self._write_segments(file_offset, size):
-            done = lib.write(
-                self._dev_handle,
-                buf_base,
-                seg_len,
-                device_off,
-                cursor,
-            )
-            if done != seg_len:
-                raise RuntimeError(
-                    f"NDS write short I/O: got {done} bytes, expected {seg_len}"
-                )
-            done_total += seg_len
-            cursor += seg_len
-        # Drop any cached file pages for this range so a later read cannot
-        # observe the pre-DMA contents. Pages are clean after the O_DIRECT fill.
-        os.posix_fadvise(self._fd, file_offset, size, os.POSIX_FADV_DONTNEED)
-        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        sub.result.value = done_total
-        return sub
-
-    def _run_sync_io(
-        self,
-        operation: str,
-        buf_base: int,
-        size: int,
-        file_offset: int,
-        buf_offset: int,
-        raw_stream: int,
-    ) -> Submission:
-        self._backend._validate_stream(raw_stream)
-        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
-        self._backend.synchronize_for_stream(raw_stream)
-        lib = self._backend._library()
-        if operation == "read":
-            done = lib.read(self._handle, buf_base, size, file_offset, buf_offset)
-        else:
-            done = lib.write(self._handle, buf_base, size, file_offset, buf_offset)
-        if done != size:
-            raise RuntimeError(
-                f"NDS {operation} short I/O: got {done} bytes, expected {size}"
-            )
-        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-        sub.result.value = size
-        return sub

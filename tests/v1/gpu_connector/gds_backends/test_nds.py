@@ -3,6 +3,8 @@
 
 # Standard
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -12,6 +14,38 @@ import torch
 from lmcache.v1.gpu_connector._gds_backends import available_backends, create_backend
 from lmcache.v1.gpu_connector.gds_backends.base import Submission
 from lmcache.v1.gpu_connector.gds_backends.nds import Backend, NDSHandle, _SlabExtent
+
+
+def _run_host_callback_immediately(raw_stream: int, callback) -> None:
+    callback()
+
+
+def _append_host_callback(raw_stream: int, callback, captured: list) -> None:
+    captured.append(callback)
+
+
+def _mock_npu_for_stream(stream_id: int, launch_host_func):
+    stream = MagicMock()
+    stream.npu_stream = stream_id
+    stream.launch_host_func = launch_host_func
+    npu_mod = MagicMock()
+    npu_mod.is_available.return_value = True
+    npu_mod.current_stream.return_value = stream
+    return npu_mod
+
+
+def _register_region(backend: Backend, base_ptr: int = 0x1000, nbytes: int = 8192) -> None:
+    backend._regions.append(
+        __import__(
+            "lmcache.v1.gpu_connector.gds_backends.nds", fromlist=["_RegisteredRegion"]
+        )._RegisteredRegion(
+            tensor=MagicMock(),
+            base_ptr=base_ptr,
+            nbytes=nbytes,
+            device_index=0,
+        )
+    )
+    backend._region_base_ptrs.append(base_ptr)
 
 
 def test_nds_listed_in_available_backends():
@@ -34,6 +68,36 @@ def test_nds_is_default_when_npu_available(monkeypatch):
 def test_nds_is_not_default_without_npu(monkeypatch):
     monkeypatch.setattr(torch, "npu", None, raising=False)
     assert not Backend.is_default()
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds._sync_transfer_stream")
+def test_synchronize_for_stream_uses_stream_pointer(mock_sync):
+    backend = Backend()
+    backend._registered_streams.add(0xABCD)
+    npu_mod = MagicMock()
+    npu_mod.is_available.return_value = True
+    with patch.object(torch, "npu", npu_mod, create=True):
+        backend.synchronize_for_stream(0xABCD)
+    mock_sync.assert_called_once_with(0xABCD)
+
+
+def test_synchronize_for_stream_rejects_unregistered_stream():
+    backend = Backend()
+    with pytest.raises(RuntimeError, match="not registered"):
+        backend.synchronize_for_stream(99)
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds._sync_transfer_stream")
+def test_synchronize_for_stream_does_not_call_device_synchronize(mock_sync):
+    backend = Backend()
+    backend._registered_streams.add(1)
+    npu_mod = MagicMock()
+    npu_mod.is_available.return_value = True
+    npu_mod.synchronize = MagicMock()
+    with patch.object(torch, "npu", npu_mod, create=True):
+        backend.synchronize_for_stream(1)
+        npu_mod.synchronize.assert_not_called()
+    mock_sync.assert_called_once_with(1)
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
@@ -81,27 +145,88 @@ def test_register_buffer_rejects_second_device(mock_library):
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
-def test_nds_handle_read_async_sets_submission(mock_library):
+@patch(
+    "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+    side_effect=_run_host_callback_immediately,
+)
+def test_nds_handle_read_async_sets_submission(mock_launch, mock_library):
     mock_library.return_value.read.return_value = 4096
     mock_library.return_value.capabilities.return_value = MagicMock(can_write=False)
     backend = Backend()
     backend._slab_size_bytes = 1 << 20
     backend._registered_streams.add(7)
-    backend._regions.append(
-        __import__(
-            "lmcache.v1.gpu_connector.gds_backends.nds", fromlist=["_RegisteredRegion"]
-        )._RegisteredRegion(
-            tensor=MagicMock(),
-            base_ptr=0x1000,
-            nbytes=8192,
-            device_index=0,
-        )
-    )
-    backend._region_base_ptrs.append(0x1000)
+    _register_region(backend)
     handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=backend._slab_size_bytes)
-    backend.synchronize_for_stream = MagicMock()  # type: ignore[method-assign]
-    sub = handle.read_async(0x1000, 4096, 0, 0, 7)
+    npu_mod = _mock_npu_for_stream(7, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        sub = handle.read_async(0x1000, 4096, 0, 0, 7)
     assert isinstance(sub, Submission)
+    assert sub.bytes_done == 4096
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_nds_handle_read_async_defers_until_callback(mock_library):
+    mock_library.return_value.read.return_value = 4096
+    captured: list = []
+
+    def capture(raw_stream: int, callback) -> None:
+        _append_host_callback(raw_stream, callback, captured)
+
+    backend = Backend()
+    backend._slab_size_bytes = 4096
+    backend._registered_streams.add(7)
+    _register_region(backend)
+    handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=4096)
+    npu_mod = _mock_npu_for_stream(7, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        with patch(
+            "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+            side_effect=capture,
+        ):
+            sub = handle.read_async(0x1000, 4096, 0, 0, 7)
+    assert sub.bytes_done == 0
+    mock_library.return_value.read.assert_not_called()
+    captured[0]()
+    assert sub.bytes_done == 4096
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_read_async_rejects_wrong_current_stream(mock_library):
+    backend = Backend()
+    backend._registered_streams.add(7)
+    _register_region(backend)
+    handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=4096)
+    npu_mod = _mock_npu_for_stream(8, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        with pytest.raises(RuntimeError, match="current NPU stream"):
+            handle.read_async(0x1000, 4096, 0, 0, 7)
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_read_async_uses_acl_host_func_when_stream_lacks_launch(mock_library):
+    mock_library.return_value.read.return_value = 4096
+    backend = Backend()
+    backend._registered_streams.add(7)
+    _register_region(backend)
+    handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=4096)
+    stream = MagicMock()
+    stream.npu_stream = 7
+    del stream.launch_host_func
+    npu_mod = MagicMock()
+    npu_mod.is_available.return_value = True
+    npu_mod.current_stream.return_value = stream
+    acl_lib = MagicMock()
+    acl_lib.aclrtLaunchHostFunc.return_value = 0
+    with patch.object(torch, "npu", npu_mod, create=True):
+        with patch(
+            "lmcache.v1.gpu_connector.gds_backends.nds._acl_rt_library",
+            return_value=acl_lib,
+        ):
+            with patch(
+                "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+                side_effect=_run_host_callback_immediately,
+            ):
+                sub = handle.read_async(0x1000, 4096, 0, 0, 7)
     assert sub.bytes_done == 4096
 
 
@@ -118,23 +243,58 @@ def test_nds_handle_close_idempotent():
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
-def test_nds_handle_write_async_uses_block_device_offset(mock_library):
+def test_close_waits_for_inflight_callback(mock_library):
+    mock_library.return_value.read.return_value = 4096
+    captured: list = []
+
+    def capture(raw_stream: int, callback) -> None:
+        _append_host_callback(raw_stream, callback, captured)
+
+    backend = Backend()
+    backend._registered_streams.add(7)
+    _register_region(backend)
+    handle = NDSHandle(backend, 5, MagicMock(), "/p", slab_size=4096)
+    handle._dev_fd = 6
+    handle._dev_handle = MagicMock()
+    deregister = MagicMock(wraps=backend.deregister_handle)
+    backend.deregister_handle = deregister  # type: ignore[method-assign]
+    npu_mod = _mock_npu_for_stream(7, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        with patch(
+            "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+            side_effect=capture,
+        ):
+            handle.read_async(0x1000, 4096, 0, 0, 7)
+    closed = threading.Event()
+
+    def close_in_thread() -> None:
+        handle.close()
+        closed.set()
+
+    thread = threading.Thread(target=close_in_thread)
+    thread.start()
+    time.sleep(0.05)
+    assert not closed.is_set()
+    captured[0]()
+    thread.join(timeout=2.0)
+    assert closed.is_set()
+    assert deregister.call_count >= 1
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+@patch(
+    "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+    side_effect=_run_host_callback_immediately,
+)
+def test_nds_handle_write_async_uses_block_device_offset(
+    mock_launch, mock_library
+):
     mock_library.return_value.write.return_value = 4096
     mock_library.return_value.capabilities.return_value = MagicMock(can_write=True)
     backend = Backend()
     backend._slab_size_bytes = 8192
     backend._registered_streams.add(7)
-    backend._regions.append(
-        __import__(
-            "lmcache.v1.gpu_connector.gds_backends.nds", fromlist=["_RegisteredRegion"]
-        )._RegisteredRegion(
-            tensor=MagicMock(),
-            base_ptr=0x1000,
-            nbytes=8192,
-            device_index=0,
-        )
-    )
-    backend._region_base_ptrs.append(0x1000)
+    _register_region(backend)
     handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=8192)
     handle._dev_fd = 99
     handle._dev_handle = 88
@@ -142,9 +302,10 @@ def test_nds_handle_write_async_uses_block_device_offset(mock_library):
         _SlabExtent(logical=0, physical=0xA000, length=4096, flags=0),
         _SlabExtent(logical=4096, physical=0xB000, length=4096, flags=0),
     ]
-    backend.synchronize_for_stream = MagicMock()  # type: ignore[method-assign]
     handle._ensure_extents_initialized = MagicMock()  # type: ignore[method-assign]
-    sub = handle.write_async(0x1000, 8192, 0, 0, 7)
+    npu_mod = _mock_npu_for_stream(7, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        sub = handle.write_async(0x1000, 8192, 0, 0, 7)
     assert sub.bytes_done == 8192
     assert mock_library.return_value.write.call_count == 2
     first = mock_library.return_value.write.call_args_list[0]
@@ -158,25 +319,20 @@ def test_nds_handle_write_async_uses_block_device_offset(mock_library):
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
-def test_nds_handle_read_async_uses_file_fd(mock_library):
+@patch(
+    "lmcache.v1.gpu_connector.gds_backends.nds._launch_nds_host_callback",
+    side_effect=_run_host_callback_immediately,
+)
+def test_nds_handle_read_async_uses_file_fd(mock_launch, mock_library):
     mock_library.return_value.read.return_value = 4096
     backend = Backend()
     backend._slab_size_bytes = 4096
     backend._registered_streams.add(7)
-    backend._regions.append(
-        __import__(
-            "lmcache.v1.gpu_connector.gds_backends.nds", fromlist=["_RegisteredRegion"]
-        )._RegisteredRegion(
-            tensor=MagicMock(),
-            base_ptr=0x1000,
-            nbytes=8192,
-            device_index=0,
-        )
-    )
-    backend._region_base_ptrs.append(0x1000)
+    _register_region(backend)
     handle = NDSHandle(backend, 11, MagicMock(), "/p", slab_size=4096)
-    backend.synchronize_for_stream = MagicMock()  # type: ignore[method-assign]
-    handle.read_async(0x1000, 4096, 0, 0, 7)
+    npu_mod = _mock_npu_for_stream(7, MagicMock())
+    with patch.object(torch, "npu", npu_mod, create=True):
+        handle.read_async(0x1000, 4096, 0, 0, 7)
     mock_library.return_value.read.assert_called_once()
     assert mock_library.return_value.read.call_args.args[0] == handle._handle
     mock_library.return_value.write.assert_not_called()
@@ -209,6 +365,7 @@ def test_nds_handle_reads_slab_without_lmcache():
         backend.register_stream(stream)
         backend.register_buffer(buf)
         sub = h.read_async(buf.data_ptr(), 4096, 0, 0, stream)
+        torch.npu.synchronize()
         assert sub.bytes_done == 4096
         h.close()
     finally:
@@ -240,9 +397,10 @@ def test_nds_handle_roundtrip_without_lmcache():
         pattern = torch.full((4096,), 0xCD, dtype=torch.uint8, device="npu:0")
         buf.copy_(pattern)
         h.write_async(buf.data_ptr(), 4096, 0, 0, stream)
-        buf.zero_()
         torch.npu.synchronize()
+        buf.zero_()
         sub = h.read_async(buf.data_ptr(), 4096, 0, 0, stream)
+        torch.npu.synchronize()
         assert sub.bytes_done == 4096
         assert torch.equal(buf.cpu(), pattern.cpu())
         h.close()
