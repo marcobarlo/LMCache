@@ -265,7 +265,11 @@ class Backend(FileGDSBackend):
         self._regions: list[_RegisteredRegion] = []
         self._region_base_ptrs: list[int] = []
         self._slab_size_bytes: int = 0
-        self._io_submit_lock = threading.Lock()
+        # No I/O-submission lock here: the openEuler adapter's nds_io_submit
+        # is safe to call concurrently (short-held internal lock) and a
+        # single dedicated reaper thread owns nds_io_getevents, demuxing
+        # completions by user_data. Serializing every handle/stream behind
+        # one Python lock here would defeat that and cap queue depth at 1.
 
     @classmethod
     def is_default(cls) -> bool:
@@ -486,8 +490,7 @@ class NDSHandle(FDGDSHandle):
 
         def host_work() -> None:
             try:
-                with self._backend._io_submit_lock:
-                    sub.result.value = io_fn()
+                sub.result.value = io_fn()
             except BaseException as exc:
                 sub.result.value = _failure_result(exc)
             finally:
