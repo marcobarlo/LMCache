@@ -27,7 +27,10 @@ from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.multiprocess.custom_types import KVCache
 from lmcache.v1.multiprocess.group_view import engine_group_layer_indices
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.gpu_connector.gds_context import get_gds_context
+from lmcache.v1.gpu_connector.gds_context import (
+    deregister_gds_gpu_buffer,
+    register_gds_gpu_buffer,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -370,7 +373,7 @@ class NpuCacheContext(BaseCacheContext):
     def _register_gds_buffer(self) -> None:
         """Register flat staging memory with the process GDS context on this stream."""
         with torch_dev.stream(self.stream_):
-            get_gds_context().register_gpu_buffer(self._temp_buffer.buffer)
+            register_gds_gpu_buffer(self._temp_buffer.buffer)
         self._gds_buffer_registered = True
 
     def _deregister_gds_buffer(self) -> None:
@@ -383,7 +386,7 @@ class NpuCacheContext(BaseCacheContext):
             synchronize()
         try:
             with torch_dev.stream(self.stream_):
-                get_gds_context().deregister_gpu_buffer(self._temp_buffer.buffer)
+                deregister_gds_gpu_buffer(self._temp_buffer.buffer)
         finally:
             self._gds_buffer_registered = False
 

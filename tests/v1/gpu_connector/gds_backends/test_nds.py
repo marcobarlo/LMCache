@@ -53,8 +53,7 @@ def _deferred_read_async(deferred: list):
 
 
 def _immediate_write_async(mock_lib):
-    def _fn(dev_handle, buf_base, segments, result, stream, on_complete=None, mem_handle=0):
-        del mem_handle
+    def _fn(dev_handle, buf_base, segments, result, stream, on_complete=None):
         for device_off, seg_len, ptr_off in segments:
             mock_lib.write(dev_handle, buf_base, seg_len, device_off, ptr_off)
         if on_complete is not None:
@@ -106,28 +105,25 @@ def test_register_buffer_rejects_cpu(mock_library):
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
-def test_register_buffer_rejects_second_device(mock_library):
+def test_register_buffer_accepts_second_device(mock_library):
     backend = Backend()
-    backend._bound_device_index = 0
-    if not hasattr(torch, "npu"):
-        pytest.skip("torch.npu not present")
-    t0 = MagicMock()
-    t0.device.type = "npu"
-    t0.device.index = 0
-    t0.is_contiguous.return_value = True
-    t0.view.return_value = t0
-    t0.numel.return_value = 4096
-    t0.data_ptr.return_value = 0x1000
-    t1 = MagicMock()
-    t1.device.type = "npu"
-    t1.device.index = 1
-    t1.is_contiguous.return_value = True
-    t1.view.return_value = t1
-    t1.numel.return_value = 4096
-    t1.data_ptr.return_value = 0x2000
-    backend.register_buffer(t0)
-    with pytest.raises(ValueError, match="one NPU"):
-        backend.register_buffer(t1)
+    lib = mock_library.return_value
+    lib.capabilities.return_value.requires_buffer_registration = False
+    buffers = []
+    for index, ptr in ((0, 0x1000), (1, 0x2000)):
+        buf = MagicMock()
+        buf.device.type = "npu"
+        buf.device.index = index
+        buf.is_contiguous.return_value = True
+        buf.view.return_value = buf
+        buf.__getitem__.return_value = buf
+        buf.numel.return_value = 4096
+        buf.data_ptr.return_value = ptr
+        buffers.append(buf)
+    backend.register_buffer(buffers[0])
+    backend.register_buffer(buffers[1])
+    assert [reg.base_ptr for reg in backend._regions] == [0x1000, 0x2000]
+    assert [reg.device_index for reg in backend._regions] == [0, 1]
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
@@ -155,7 +151,7 @@ def test_register_buffer_unregisters_pinned_regions_on_failure(mock_library):
     with pytest.raises(OSError, match="pin failed"):
         backend.register_buffer(buf)
 
-    lib.unregister_memory.assert_called_once_with(0x1000, region_size, 42)
+    lib.unregister_memory.assert_called_once_with(0x1000, region_size)
     assert backend._regions == []
     assert backend._region_base_ptrs == []
 
@@ -205,7 +201,7 @@ def test_nds_handle_read_async_forwards_stream_and_result(mock_library):
     sub = handle.read_async(0x1000, 4096, 0, 0, 7)
     mock_library.return_value.read.assert_not_called()
     mock_library.return_value.read_async.assert_called_once_with(
-        handle._handle, 0x1000, 4096, 0, 0, sub.result, 7, 0
+        handle._handle, 0x1000, 4096, 0, 0, sub.result, 7
     )
 
 
@@ -252,9 +248,35 @@ def test_nds_handle_write_async_forwards_segments_and_on_complete(mock_library):
     assert wcall.args[0] == 88
     segments = wcall.args[2]
     assert segments[0][0] == 0xA000 and segments[1][0] == 0xB000
+    assert segments[0][2] == 0 and segments[1][2] == 4096
     assert wcall.kwargs["on_complete"] is not None
     fadvise.assert_called_once_with(handle._fd, 0, 8192, os.POSIX_FADV_DONTNEED)
     assert mock_library.return_value.write.call_count == 2
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_nds_write_segments_use_buffer_offset_not_file_offset(mock_library):
+    mock_library.return_value.write.return_value = 4096
+    mock_library.return_value.capabilities.return_value = MagicMock(can_write=True)
+    mock_library.return_value.write_async.side_effect = _immediate_write_async(
+        mock_library.return_value
+    )
+    backend = Backend()
+    backend._slab_size_bytes = 16384
+    backend._registered_streams.add(7)
+    _register_region(backend, nbytes=8192)
+    handle = NDSHandle(backend, 1, MagicMock(), "/p", slab_size=16384)
+    handle._dev_fd = 99
+    handle._dev_handle = 88
+    handle._extents = FileExtentMap(
+        (FileExtent(logical=0, physical=0xA000, length=16384, flags=0),),
+        16384,
+    )
+    handle._ensure_extents_initialized = MagicMock()  # type: ignore[method-assign]
+    with patch("os.posix_fadvise"):
+        handle.write_async(0x1000, 4096, 8192, 0, 7)
+    segments = mock_library.return_value.write_async.call_args.args[2]
+    assert segments == [(0xA000 + 8192, 4096, 0)]
 
 
 def test_nds_handle_close_idempotent_file_only():

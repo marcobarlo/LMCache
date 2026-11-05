@@ -20,12 +20,9 @@ def test_npu_device_spec_stream_handle():
         spec.get_stream_handle(SimpleNamespace(npu_stream=0))
 
 
-@patch("lmcache.v1.gpu_connector.gds_context.get_gds_context")
-def test_npu_cache_context_deregisters_on_close(mock_get_ctx):
+def test_npu_cache_context_deregisters_on_close():
     from lmcache.v1.platform.devices.npu import cache_context as mod
 
-    gds_ctx = MagicMock()
-    mock_get_ctx.return_value = gds_ctx
     ctx = mod.NpuCacheContext.__new__(mod.NpuCacheContext)
     ctx._ipc_wrappers = (MagicMock(),)
     ctx._gds_buffer_registered = True
@@ -33,6 +30,9 @@ def test_npu_cache_context_deregisters_on_close(mock_get_ctx):
     ctx._temp_buffer = MagicMock()
     ctx._temp_buffer.buffer = torch.empty(1, dtype=torch.uint8)
     ctx.kv_caches_ = []
-    with patch.object(mod.torch_dev, "stream", return_value=MagicMock()):
+    with (
+        patch.object(mod.torch_dev, "stream", return_value=MagicMock()),
+        patch.object(mod, "deregister_gds_gpu_buffer") as mock_deregister,
+    ):
         ctx.close()
-    gds_ctx.deregister_gpu_buffer.assert_called_once()
+    mock_deregister.assert_called_once_with(ctx._temp_buffer.buffer)
