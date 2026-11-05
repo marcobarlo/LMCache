@@ -5,17 +5,13 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import bisect
 import ctypes
-import fcntl
 import os
 import stat
-import struct
-import threading
 
 # Third Party
 import torch
@@ -24,117 +20,11 @@ import torch
 from lmcache.v1.gpu_connector.gds_backends._driver import SharedDriver
 from lmcache.v1.gpu_connector.gds_backends._file import FDGDSHandle, FileGDSBackend
 from lmcache.v1.gpu_connector.gds_backends.base import GDSHandle, Submission
+from lmcache.v1.gpu_connector.gds_backends.fiemap import FileExtentMap
 
 _GDS_ALIGNMENT = 4096
 _MAX_GDS_REGION = 16 * 1024 * 1024
 _NDS_SECTOR = 512
-
-FS_IOC_FIEMAP = 0xC020660B
-# struct fiemap is 32 bytes; struct fiemap_extent is 56 (fe_reserved64[2]
-# sits between fe_length and fe_flags). A 40-byte stride under-allocates
-# the ioctl buffer and mis-reads every extent after the first.
-_FIEMAP_HEADER_SIZE = 32
-_FIEMAP_EXTENT_SIZE = 56
-
-
-def _sync_transfer_stream(raw_stream: int) -> None:
-    """Wait on one ``aclrtStream`` before NDS I/O (stream-scoped, not device-wide)."""
-    from lmcache.v1.platform.devices.npu.device_ops import (
-        _synchronize_npu_stream_pointer,
-    )
-
-    _synchronize_npu_stream_pointer(raw_stream)
-
-
-def _failure_result(exc: BaseException) -> int:
-    """Map an exception to a negative ``Submission.result`` for deferred I/O."""
-    if isinstance(exc, OSError) and exc.errno is not None:
-        return -int(exc.errno)
-    return -1
-
-
-_ACL_HOST_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-_ACL_RT_LIB: ctypes.CDLL | None = None
-_NDS_HOST_CALLBACK_REFS: list[_ACL_HOST_FUNC] = []
-
-
-def _acl_rt_library() -> ctypes.CDLL:
-    """Lazy ``libascendcl`` handle for ``aclrtLaunchHostFunc``."""
-    global _ACL_RT_LIB
-    if _ACL_RT_LIB is None:
-        lib = ctypes.CDLL("libascendcl.so")
-        lib.aclrtLaunchHostFunc.argtypes = [
-            ctypes.c_void_p,
-            _ACL_HOST_FUNC,
-            ctypes.c_void_p,
-        ]
-        lib.aclrtLaunchHostFunc.restype = ctypes.c_int
-        _ACL_RT_LIB = lib
-    return _ACL_RT_LIB
-
-
-def _launch_nds_host_callback(raw_stream: int, callback: Callable[[], None]) -> None:
-    """Enqueue ``callback`` on the current NPU stream after prior stream work."""
-    npu = getattr(torch, "npu", None)
-    if npu is None or not npu.is_available():
-        raise RuntimeError("nds I/O requires torch.npu")
-    stream = npu.current_stream()
-    handle = getattr(stream, "npu_stream", None)
-    if not isinstance(handle, int) or handle != raw_stream:
-        current = handle if isinstance(handle, int) else 0
-        raise RuntimeError(
-            f"NDS I/O must run on the current NPU stream "
-            f"(registered 0x{raw_stream:x}, current 0x{current:x})"
-        )
-    launch_host_func = getattr(stream, "launch_host_func", None)
-    if callable(launch_host_func):
-        launch_host_func(callback)
-        return
-
-    @_ACL_HOST_FUNC
-    def trampoline(_arg: int) -> None:
-        callback()
-
-    _NDS_HOST_CALLBACK_REFS.append(trampoline)
-    err = _acl_rt_library().aclrtLaunchHostFunc(
-        ctypes.c_void_p(raw_stream),
-        trampoline,
-        None,
-    )
-    if int(err) != 0:
-        _NDS_HOST_CALLBACK_REFS.pop()
-        raise RuntimeError(f"aclrtLaunchHostFunc failed with error {err}")
-
-
-_FIEMAP_FLAG_SYNC = 0x1
-FIEMAP_EXTENT_LAST = 0x00000001
-FIEMAP_EXTENT_UNKNOWN = 0x00000002
-FIEMAP_EXTENT_DELALLOC = 0x00000004
-FIEMAP_EXTENT_ENCODED = 0x00000008
-FIEMAP_EXTENT_DATA_ENCRYPTED = 0x00000080
-FIEMAP_EXTENT_NOT_ALIGNED = 0x00000100
-FIEMAP_EXTENT_DATA_INLINE = 0x00000200
-FIEMAP_EXTENT_DATA_TAIL = 0x00000400
-FIEMAP_EXTENT_UNWRITTEN = 0x00000800
-_UNSUPPORTED_FIEMAP_FLAGS = (
-    FIEMAP_EXTENT_UNKNOWN
-    | FIEMAP_EXTENT_DELALLOC
-    | FIEMAP_EXTENT_ENCODED
-    | FIEMAP_EXTENT_DATA_ENCRYPTED
-    | FIEMAP_EXTENT_NOT_ALIGNED
-    | FIEMAP_EXTENT_DATA_INLINE
-    | FIEMAP_EXTENT_DATA_TAIL
-)
-
-
-@dataclass(frozen=True)
-class _SlabExtent:
-    """One FIEMAP slice: logical byte range in the slab file and its disk physical range."""
-
-    logical: int
-    physical: int
-    length: int
-    flags: int
 
 
 @dataclass
@@ -145,95 +35,6 @@ class _RegisteredRegion:
     base_ptr: int
     nbytes: int
     device_index: int
-
-
-def _fiemap_extents(fd: int, size: int) -> list[_SlabExtent]:
-    """Query ``FS_IOC_FIEMAP`` for ``[0, size)`` on an open slab file fd.
-
-    Returns extents trimmed to the slab size, in ascending logical order until
-    ``FIEMAP_EXTENT_LAST`` or the range is exhausted. Each extent record is
-    the 56-byte ``struct fiemap_extent``; flags live at byte 40 of that record.
-    """
-    fm_start = 0
-    out: list[_SlabExtent] = []
-    while fm_start < size:
-        extent_count = 128
-        buf = bytearray(_FIEMAP_HEADER_SIZE + extent_count * _FIEMAP_EXTENT_SIZE)
-        query_len = size - fm_start
-        struct.pack_into(
-            "<QQIIII",
-            buf,
-            0,
-            fm_start,
-            query_len,
-            _FIEMAP_FLAG_SYNC,
-            0,
-            extent_count,
-            0,
-        )
-        fcntl.ioctl(fd, FS_IOC_FIEMAP, buf, True)
-        _, _, _, mapped, _, _ = struct.unpack_from("<QQIIII", buf, 0)
-        if mapped == 0:
-            break
-        mapped = min(mapped, extent_count)
-        last_logical = fm_start
-        for i in range(mapped):
-            base = _FIEMAP_HEADER_SIZE + i * _FIEMAP_EXTENT_SIZE
-            logical, physical, length = struct.unpack_from("<QQQ", buf, base)
-            (flags,) = struct.unpack_from("<I", buf, base + 40)
-            if logical + length <= 0 or length == 0:
-                continue
-            if logical >= size:
-                continue
-            trim_end = min(logical + length, size)
-            trim_start = max(logical, 0)
-            if trim_end <= trim_start:
-                continue
-            out.append(
-                _SlabExtent(
-                    logical=trim_start,
-                    physical=physical + (trim_start - logical),
-                    length=trim_end - trim_start,
-                    flags=flags,
-                )
-            )
-            last_logical = max(last_logical, logical + length)
-            if flags & FIEMAP_EXTENT_LAST:
-                if last_logical >= size:
-                    return out
-                break
-        if last_logical <= fm_start:
-            break
-        fm_start = last_logical
-    return out
-
-
-def _validate_slab_extents(extents: list[_SlabExtent], size: int) -> None:
-    """Reject slabs NDS store cannot use: gaps, short coverage, alignment, bad flags."""
-    if not extents:
-        raise ValueError("NDS slab has no FIEMAP extents")
-    pos = 0
-    for ext in extents:
-        if ext.logical != pos:
-            raise ValueError(
-                f"NDS slab extents have a gap at byte {pos} (got logical {ext.logical})"
-            )
-        if ext.length <= 0 or ext.length % _NDS_SECTOR:
-            raise ValueError(
-                f"NDS extent length must be a positive multiple of 512: {ext}"
-            )
-        if ext.physical <= 0 or ext.physical % _NDS_SECTOR:
-            raise ValueError(
-                f"NDS extent physical offset must be a positive multiple of 512: {ext}"
-            )
-        bad = ext.flags & _UNSUPPORTED_FIEMAP_FLAGS
-        if bad:
-            raise ValueError(
-                f"NDS extent has unsupported FIEMAP flags 0x{bad:x}: {ext}"
-            )
-        pos += ext.length
-    if pos < size:
-        raise ValueError(f"NDS slab extents cover {pos} bytes, need {size}")
 
 
 def _block_device_path_for_file(path: str) -> str:
@@ -265,11 +66,6 @@ class Backend(FileGDSBackend):
         self._regions: list[_RegisteredRegion] = []
         self._region_base_ptrs: list[int] = []
         self._slab_size_bytes: int = 0
-        # No I/O-submission lock here: the openEuler adapter's nds_io_submit
-        # is safe to call concurrently (short-held internal lock) and a
-        # single dedicated reaper thread owns nds_io_getevents, demuxing
-        # completions by user_data. Serializing every handle/stream behind
-        # one Python lock here would defeat that and cap queue depth at 1.
 
     @classmethod
     def is_default(cls) -> bool:
@@ -424,13 +220,6 @@ class Backend(FileGDSBackend):
         if buf_offset + size > region.nbytes:
             raise RuntimeError("buffer I/O exceeds registered region")
 
-    def synchronize_for_stream(self, raw_stream: int) -> None:
-        """Wait for prior work on the registered transfer stream before NDS I/O."""
-        self._validate_stream(raw_stream)
-        if not getattr(torch, "npu", None) or not torch.npu.is_available():
-            return
-        _sync_transfer_stream(raw_stream)
-
     def _library(self):
         from lmcache_ascend.v1.gds.nds_library import get_nds_library
 
@@ -458,46 +247,10 @@ class NDSHandle(FDGDSHandle):
         super().__init__(backend, fd, handle, path)
         self._backend: Backend = backend
         self._slab_size = slab_size
-        self._extents: list[_SlabExtent] = []
+        self._extents: FileExtentMap | None = None
         self._dev_fd = -1
         self._dev_handle: Any = None
         self._dev_path = ""
-        self._callback_inflight = 0
-        self._callback_lock = threading.Lock()
-        self._callback_done = threading.Condition(self._callback_lock)
-
-    def _begin_callback(self) -> None:
-        with self._callback_lock:
-            self._callback_inflight += 1
-
-    def _end_callback(self) -> None:
-        with self._callback_lock:
-            self._callback_inflight -= 1
-            self._callback_done.notify_all()
-
-    def _wait_callbacks(self) -> None:
-        with self._callback_lock:
-            while self._callback_inflight > 0:
-                self._callback_done.wait()
-
-    def _enqueue_host_io(
-        self,
-        raw_stream: int,
-        sub: Submission,
-        io_fn: Callable[[], int],
-    ) -> Submission:
-        self._begin_callback()
-
-        def host_work() -> None:
-            try:
-                sub.result.value = io_fn()
-            except BaseException as exc:
-                sub.result.value = _failure_result(exc)
-            finally:
-                self._end_callback()
-
-        _launch_nds_host_callback(raw_stream, host_work)
-        return sub
 
     def attach_store_device(self, backend: Backend, slab_size: int) -> None:
         """Prepare NDS store: FIEMAP map, block ``/dev`` open, and ``nds_register_fs``.
@@ -509,8 +262,7 @@ class NDSHandle(FDGDSHandle):
         closed; the file handle is unchanged (see :meth:`Backend.open_slab`).
         """
         self._slab_size = slab_size
-        self._extents = _fiemap_extents(self._fd, slab_size)
-        _validate_slab_extents(self._extents, slab_size)
+        self._extents = FileExtentMap.load(self._fd, slab_size)
         self._dev_path = _block_device_path_for_file(self.path)
         dev_fd = os.open(self._dev_path, os.O_RDWR)
         try:
@@ -522,7 +274,7 @@ class NDSHandle(FDGDSHandle):
         self._dev_handle = dev_handle
 
     def close(self) -> None:
-        self._wait_callbacks()
+        self._backend._library().wait_callbacks()
         if self._dev_fd >= 0:
             dev_fd = self._dev_fd
             dev_handle = self._dev_handle
@@ -551,17 +303,17 @@ class NDSHandle(FDGDSHandle):
         self._backend._validate_stream(raw_stream)
         self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
-
-        def io_fn() -> int:
-            lib = self._backend._library()
-            done = lib.read(self._handle, buf_base, size, file_offset, buf_offset)
-            if done != size:
-                raise RuntimeError(
-                    f"NDS read short I/O: got {done} bytes, expected {size}"
-                )
-            return size
-
-        return self._enqueue_host_io(raw_stream, sub, io_fn)
+        lib = self._backend._library()
+        lib.read_async(
+            self._handle,
+            buf_base,
+            size,
+            file_offset,
+            buf_offset,
+            sub.result,
+            raw_stream,
+        )
+        return sub
 
     def write_async(
         self,
@@ -586,29 +338,20 @@ class NDSHandle(FDGDSHandle):
         self._ensure_extents_initialized(file_offset, size)
         segments = self._write_segments(file_offset, size)
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+        lib = self._backend._library()
 
-        def io_fn() -> int:
-            lib = self._backend._library()
-            done_total = 0
-            cursor = buf_offset
-            for device_off, seg_len, _logical in segments:
-                done = lib.write(
-                    self._dev_handle,
-                    buf_base,
-                    seg_len,
-                    device_off,
-                    cursor,
-                )
-                if done != seg_len:
-                    raise RuntimeError(
-                        f"NDS write short I/O: got {done} bytes, expected {seg_len}"
-                    )
-                done_total += seg_len
-                cursor += seg_len
+        def after_store() -> None:
             os.posix_fadvise(self._fd, file_offset, size, os.POSIX_FADV_DONTNEED)
-            return done_total
 
-        return self._enqueue_host_io(raw_stream, sub, io_fn)
+        lib.write_async(
+            self._dev_handle,
+            buf_base,
+            segments,
+            sub.result,
+            raw_stream,
+            on_complete=after_store,
+        )
+        return sub
 
     def _ensure_extents_initialized(self, file_offset: int, size: int) -> None:
         """Allocate unwritten extents without leaving dirty zeros in the page cache.
@@ -622,16 +365,15 @@ class NDSHandle(FDGDSHandle):
         pos = file_offset
         spans: list[tuple[int, int]] = []
         while pos < end:
-            ext = self._extent_at(pos)
+            ext = self._loaded_extents().extent_at(pos)
             seg_end = min(end, ext.logical + ext.length)
-            if ext.flags & FIEMAP_EXTENT_UNWRITTEN:
+            if ext.unwritten:
                 spans.append((pos, seg_end - pos))
             pos = seg_end
         if not spans:
             return
         # Anonymous mmap is page-aligned. os.pwrite may copy and break
         # O_DIRECT alignment, so the write goes through libc.pwrite.
-        import ctypes
         import mmap
 
         chunk = 1024 * 1024
@@ -672,16 +414,13 @@ class NDSHandle(FDGDSHandle):
                 buf.close()
         finally:
             os.close(direct_fd)
-        self._extents = _fiemap_extents(self._fd, self._slab_size)
-        _validate_slab_extents(self._extents, self._slab_size)
+        self._extents = FileExtentMap.load(self._fd, self._slab_size)
 
-    def _extent_at(self, logical_offset: int) -> _SlabExtent:
-        for ext in self._extents:
-            if ext.logical <= logical_offset < ext.logical + ext.length:
-                return ext
-        raise RuntimeError(
-            f"NDS slab logical offset {logical_offset} is not covered by FIEMAP"
-        )
+    def _loaded_extents(self) -> FileExtentMap:
+        extents = self._extents
+        if extents is None:
+            raise RuntimeError("NDS slab extents are not loaded")
+        return extents
 
     def _write_segments(
         self, file_offset: int, size: int
@@ -691,7 +430,7 @@ class NDSHandle(FDGDSHandle):
         end = file_offset + size
         pos = file_offset
         while pos < end:
-            ext = self._extent_at(pos)
+            ext = self._loaded_extents().extent_at(pos)
             seg_end = min(end, ext.logical + ext.length)
             seg_len = seg_end - pos
             device_off = ext.physical + (pos - ext.logical)
