@@ -244,6 +244,9 @@ class GDSContext:
             return
         stream = platform_stream.current_stream(buffer.device)
         raw_stream = platform_stream.stream_handle(buffer.device, stream)
+        note_stream_device = getattr(self.backend, "note_stream_device", None)
+        if note_stream_device is not None:
+            note_stream_device(raw_stream, int(buffer.device.index or 0))
         buf = buffer.view(torch.uint8)
         nbytes = buf.numel()
         with self._registry_lock:

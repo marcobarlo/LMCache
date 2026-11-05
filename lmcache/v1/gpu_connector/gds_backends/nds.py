@@ -35,6 +35,7 @@ class _RegisteredRegion:
     base_ptr: int
     nbytes: int
     device_index: int
+    mem_handle: int = 0
 
 
 def _block_device_path_for_file(path: str) -> str:
@@ -62,6 +63,7 @@ class Backend(FileGDSBackend):
     def __init__(self) -> None:
         super().__init__()
         self._bound_device_index: int | None = None
+        self._stream_devices: dict[int, int] = {}
         self._registered_streams: set[int] = set()
         self._regions: list[_RegisteredRegion] = []
         self._region_base_ptrs: list[int] = []
@@ -122,7 +124,8 @@ class Backend(FileGDSBackend):
         if not buf.is_contiguous():
             raise ValueError("register_buffer: tensor must be contiguous")
         device_index = int(buf.device.index or 0)
-        self._bind_or_validate_device(device_index)
+        if not self._multi_device():
+            self._bind_or_validate_device(device_index)
         view = buf.view(torch.uint8)
         inserted: list[_RegisteredRegion] = []
         try:
@@ -142,7 +145,10 @@ class Backend(FileGDSBackend):
                 inserted.append(reg)
                 caps = self._library().capabilities()
                 if caps.requires_buffer_registration:
-                    self._library().register_memory(base, nbytes)
+                    registered = self._library().register_memory(
+                        base, nbytes, device_index
+                    )
+                    reg.mem_handle = registered if isinstance(registered, int) else 0
         except BaseException:
             for reg in reversed(inserted):
                 idx = bisect.bisect_left(self._region_base_ptrs, reg.base_ptr)
@@ -169,18 +175,42 @@ class Backend(FileGDSBackend):
             region = self._regions[idx]
             caps = self._library().capabilities()
             if caps.requires_buffer_registration:
-                self._library().unregister_memory(region.base_ptr, region.nbytes)
+                self._library().unregister_memory(
+                    region.base_ptr, region.nbytes, region.mem_handle
+                )
             self._region_base_ptrs.pop(idx)
             self._regions.pop(idx)
 
     def register_stream(self, raw_stream: int) -> None:
         self._registered_streams.add(raw_stream)
 
+    def note_stream_device(self, raw_stream: int, device_index: int) -> None:
+        """Remember which NPU owns a registered stream handle."""
+        previous = self._stream_devices.get(raw_stream)
+        if previous is not None and previous != device_index:
+            raise ValueError(
+                f"NDS stream {raw_stream} is already bound to NPU {previous}; "
+                f"cannot also use it for NPU {device_index}"
+            )
+        self._stream_devices[raw_stream] = device_index
+
     def deregister_stream(self, raw_stream: int) -> None:
         self._registered_streams.discard(raw_stream)
+        self._stream_devices.pop(raw_stream, None)
+
+    def _multi_device(self) -> bool:
+        return getattr(self._library(), "supports_multi_device", False) is True
 
     def _bind_or_validate_device(self, device_index: int) -> None:
-        """Pin this backend to a single NPU index for the process lifetime."""
+        """Remember the first staging buffer's NPU and reject any other.
+
+        A library that can pin an explicit NPU does not use this guard.
+        Each registration then carries its own ``devid``.
+
+        Raises:
+            ValueError: ``device_index`` differs from the NPU already bound
+                on this backend.
+        """
         if self._bound_device_index is None:
             self._bound_device_index = device_index
             return
@@ -201,8 +231,13 @@ class Backend(FileGDSBackend):
         buf_base: int,
         buf_offset: int,
         alignment: int = _GDS_ALIGNMENT,
-    ) -> None:
-        """Check GDS alignment, slab span, and registered NPU region before I/O."""
+        raw_stream: int | None = None,
+    ) -> int:
+        """Check GDS alignment, slab span, and registered NPU region before I/O.
+
+        Returns the registration handle for the selected staging region.
+        ``0`` means the library still selects the registration by address.
+        """
         if size <= 0:
             raise ValueError("I/O size must be positive")
         if file_offset < 0 or buf_offset < 0:
@@ -213,12 +248,35 @@ class Backend(FileGDSBackend):
             )
         if self._slab_size_bytes and file_offset + size > self._slab_size_bytes:
             raise ValueError("file I/O exceeds slab size")
-        idx = bisect.bisect_left(self._region_base_ptrs, buf_base)
-        if idx >= len(self._regions) or self._regions[idx].base_ptr != buf_base:
-            raise RuntimeError(f"NDS buffer base 0x{buf_base:x} is not registered")
-        region = self._regions[idx]
+        region = self._region_for_buffer(buf_base, raw_stream)
         if buf_offset + size > region.nbytes:
             raise RuntimeError("buffer I/O exceeds registered region")
+        return region.mem_handle
+
+    def _region_for_buffer(
+        self, buf_base: int, raw_stream: int | None
+    ) -> _RegisteredRegion:
+        matches = [reg for reg in self._regions if reg.base_ptr == buf_base]
+        if not matches:
+            raise RuntimeError(f"NDS buffer base 0x{buf_base:x} is not registered")
+        if len(matches) == 1:
+            return matches[0]
+        if raw_stream is None:
+            raise RuntimeError(
+                f"NDS buffer base 0x{buf_base:x} is registered on multiple NPUs"
+            )
+        device_index = self._stream_devices.get(raw_stream)
+        if device_index is None:
+            raise RuntimeError(
+                f"NDS stream {raw_stream} has no NPU for buffer 0x{buf_base:x}"
+            )
+        chosen = [reg for reg in matches if reg.device_index == device_index]
+        if len(chosen) != 1:
+            raise RuntimeError(
+                f"NDS buffer 0x{buf_base:x} has no unique region "
+                f"on NPU {device_index}"
+            )
+        return chosen[0]
 
     def _library(self):
         from lmcache_ascend.v1.gds.nds_library import get_nds_library
@@ -301,7 +359,9 @@ class NDSHandle(FDGDSHandle):
         queued on the same stream runs after the callback.
         """
         self._backend._validate_stream(raw_stream)
-        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
+        mem_handle = self._backend._validate_io_bounds(
+            file_offset, size, buf_base, buf_offset, raw_stream=raw_stream
+        )
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         lib = self._backend._library()
         lib.read_async(
@@ -312,6 +372,7 @@ class NDSHandle(FDGDSHandle):
             buf_offset,
             sub.result,
             raw_stream,
+            mem_handle,
         )
         return sub
 
@@ -334,7 +395,9 @@ class NDSHandle(FDGDSHandle):
         if self._dev_fd < 0:
             raise RuntimeError("NDS store device is not open on this handle")
         self._backend._validate_stream(raw_stream)
-        self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
+        mem_handle = self._backend._validate_io_bounds(
+            file_offset, size, buf_base, buf_offset, raw_stream=raw_stream
+        )
         self._ensure_extents_initialized(file_offset, size)
         segments = self._write_segments(file_offset, size)
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
@@ -350,6 +413,7 @@ class NDSHandle(FDGDSHandle):
             sub.result,
             raw_stream,
             on_complete=after_store,
+            mem_handle=mem_handle,
         )
         return sub
 

@@ -53,7 +53,8 @@ def _deferred_read_async(deferred: list):
 
 
 def _immediate_write_async(mock_lib):
-    def _fn(dev_handle, buf_base, segments, result, stream, on_complete=None):
+    def _fn(dev_handle, buf_base, segments, result, stream, on_complete=None, mem_handle=0):
+        del mem_handle
         for device_off, seg_len, ptr_off in segments:
             mock_lib.write(dev_handle, buf_base, seg_len, device_off, ptr_off)
         if on_complete is not None:
@@ -174,7 +175,7 @@ def test_nds_handle_read_async_forwards_stream_and_result(mock_library):
     sub = handle.read_async(0x1000, 4096, 0, 0, 7)
     mock_library.return_value.read.assert_not_called()
     mock_library.return_value.read_async.assert_called_once_with(
-        handle._handle, 0x1000, 4096, 0, 0, sub.result, 7
+        handle._handle, 0x1000, 4096, 0, 0, sub.result, 7, 0
     )
 
 
