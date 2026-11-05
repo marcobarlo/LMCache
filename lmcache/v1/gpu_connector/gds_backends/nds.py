@@ -17,10 +17,13 @@ import stat
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.gpu_connector.gds_backends._driver import SharedDriver
 from lmcache.v1.gpu_connector.gds_backends._file import FDGDSHandle, FileGDSBackend
 from lmcache.v1.gpu_connector.gds_backends.base import GDSHandle, Submission
 from lmcache.v1.gpu_connector.gds_backends.fiemap import FileExtentMap
+
+logger = init_logger(__name__)
 
 _GDS_ALIGNMENT = 4096
 _MAX_GDS_REGION = 16 * 1024 * 1024
@@ -128,6 +131,7 @@ class Backend(FileGDSBackend):
             self._bind_or_validate_device(device_index)
         view = buf.view(torch.uint8)
         inserted: list[_RegisteredRegion] = []
+        pinned: list[_RegisteredRegion] = []
         try:
             for start in range(0, view.numel(), _MAX_GDS_REGION):
                 region = view[start : min(start + _MAX_GDS_REGION, view.numel())]
@@ -149,7 +153,18 @@ class Backend(FileGDSBackend):
                         base, nbytes, device_index
                     )
                     reg.mem_handle = registered if isinstance(registered, int) else 0
+                    pinned.append(reg)
         except BaseException:
+            for reg in reversed(pinned):
+                try:
+                    self._library().unregister_memory(
+                        reg.base_ptr, reg.nbytes, reg.mem_handle
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to unregister NDS region 0x%x during rollback",
+                        reg.base_ptr,
+                    )
             for reg in reversed(inserted):
                 idx = bisect.bisect_left(self._region_base_ptrs, reg.base_ptr)
                 if (
@@ -157,7 +172,7 @@ class Backend(FileGDSBackend):
                     and self._region_base_ptrs[idx] == reg.base_ptr
                 ):
                     self._region_base_ptrs.pop(idx)
-                    self._regions.pop(idx)
+                self._regions.remove(reg)
             raise
 
     def deregister_buffer(self, buf: torch.Tensor) -> None:
@@ -256,6 +271,11 @@ class Backend(FileGDSBackend):
     def _region_for_buffer(
         self, buf_base: int, raw_stream: int | None
     ) -> _RegisteredRegion:
+        """Return the staging region registered at ``buf_base``.
+
+        When that address is pinned on more than one NPU, the stream's
+        device selects which registration to use.
+        """
         matches = [reg for reg in self._regions if reg.base_ptr == buf_base]
         if not matches:
             raise RuntimeError(f"NDS buffer base 0x{buf_base:x} is not registered")

@@ -131,6 +131,36 @@ def test_register_buffer_rejects_second_device(mock_library):
 
 
 @patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_register_buffer_unregisters_pinned_regions_on_failure(mock_library):
+    backend = Backend()
+    region_size = 16 * 1024 * 1024
+    chunks = []
+    for base in (0x1000, 0x1000 + region_size):
+        chunk = MagicMock()
+        chunk.numel.return_value = region_size
+        chunk.data_ptr.return_value = base
+        chunks.append(chunk)
+    view = MagicMock()
+    view.numel.return_value = region_size * 2
+    view.__getitem__.side_effect = chunks
+    buf = MagicMock()
+    buf.device.type = "npu"
+    buf.device.index = 0
+    buf.is_contiguous.return_value = True
+    buf.view.return_value = view
+    lib = mock_library.return_value
+    lib.capabilities.return_value.requires_buffer_registration = True
+    lib.register_memory.side_effect = [42, OSError(1, "pin failed")]
+
+    with pytest.raises(OSError, match="pin failed"):
+        backend.register_buffer(buf)
+
+    lib.unregister_memory.assert_called_once_with(0x1000, region_size, 42)
+    assert backend._regions == []
+    assert backend._region_base_ptrs == []
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
 def test_nds_handle_read_async_sets_submission(mock_library):
     mock_library.return_value.read_async.side_effect = _immediate_read_async
     mock_library.return_value.capabilities.return_value = MagicMock(can_write=False)
