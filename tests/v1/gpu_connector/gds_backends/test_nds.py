@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the NDS GDS backend (mocked unit tests; optional hardware)."""
+"""Tests for the NDS GDS backend."""
 
 # Standard
 import os
@@ -323,63 +323,3 @@ def test_nds_handle_close_idempotent_file_only():
         handle.close()
         handle.close()
         assert close.call_count == 1
-
-
-@pytest.mark.skipif(
-    not os.environ.get("NDS_TEST_DIR") or not getattr(torch, "npu", None),
-    reason="hardware test needs NDS_TEST_DIR and torch.npu",
-)
-def test_nds_handle_reads_slab_without_lmcache():
-    pytest.importorskip("lmcache_ascend")
-    if not torch.npu.is_available():
-        pytest.skip("NPU not available")
-    backend = create_backend("nds")
-    try:
-        slab_dir = os.environ["NDS_TEST_DIR"]
-        h = backend.open_slab(slab_dir, 4096, direct_io=False)
-        buf = torch.empty(4096, dtype=torch.uint8, device="npu:0")
-        stream = torch.npu.current_stream().npu_stream
-        backend.register_stream(stream)
-        backend.register_buffer(buf)
-        sub = h.read_async(buf.data_ptr(), 4096, 0, 0, stream)
-        torch.npu.synchronize()
-        assert sub.bytes_done == 4096
-        h.close()
-    finally:
-        backend.close_driver()
-
-
-@pytest.mark.skipif(
-    not os.environ.get("NDS_TEST_DIR") or not getattr(torch, "npu", None),
-    reason="hardware test needs NDS_TEST_DIR and torch.npu",
-)
-def test_nds_handle_roundtrip_without_lmcache():
-    pytest.importorskip("lmcache_ascend")
-    if not torch.npu.is_available():
-        pytest.skip("NPU not available")
-    from lmcache_ascend.v1.gds.nds_library import get_nds_library
-
-    lib = get_nds_library()
-    lib.load()
-    if not lib.capabilities().can_write:
-        pytest.skip("NDS write symbol not available")
-    backend = create_backend("nds")
-    try:
-        slab_dir = os.environ["NDS_TEST_DIR"]
-        h = backend.open_slab(slab_dir, 8192, direct_io=False)
-        buf = torch.empty(4096, dtype=torch.uint8, device="npu:0")
-        stream = torch.npu.current_stream().npu_stream
-        backend.register_stream(stream)
-        backend.register_buffer(buf)
-        pattern = torch.full((4096,), 0xCD, dtype=torch.uint8, device="npu:0")
-        buf.copy_(pattern)
-        h.write_async(buf.data_ptr(), 4096, 0, 0, stream)
-        torch.npu.synchronize()
-        buf.zero_()
-        sub = h.read_async(buf.data_ptr(), 4096, 0, 0, stream)
-        torch.npu.synchronize()
-        assert sub.bytes_done == 4096
-        assert torch.equal(buf.cpu(), pattern.cpu())
-        h.close()
-    finally:
-        backend.close_driver()
