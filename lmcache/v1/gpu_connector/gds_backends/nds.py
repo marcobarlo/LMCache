@@ -40,6 +40,24 @@ class _RegisteredRegion:
     device_index: int
 
 
+@dataclass(frozen=True)
+class _WriteSegment:
+    """One extent piece of a logical store, before buffer-offset translation."""
+
+    device_offset: int
+    length: int
+    logical_start: int
+
+
+@dataclass(frozen=True)
+class _StoreSegment:
+    """One block-device ``PWRITE``. ``buf_offset`` is into the registered pin."""
+
+    device_offset: int
+    length: int
+    buf_offset: int
+
+
 def _block_device_path_for_file(path: str) -> str:
     """Return ``/dev/...`` for the block device that hosts a file (``st_dev`` match)."""
     dev = os.stat(path).st_dev
@@ -351,13 +369,13 @@ class NDSHandle(FDGDSHandle):
         self._backend._validate_stream(raw_stream)
         self._backend._validate_io_bounds(file_offset, size, buf_base, buf_offset)
         self._ensure_extents_initialized(file_offset, size)
-        # The third field is a buffer offset. _write_segments reports the
-        # logical file position; adding that to buf_base lands outside the pin.
         segments = [
-            (device_off, seg_len, buf_offset + (logical - file_offset))
-            for device_off, seg_len, logical in self._write_segments(
-                file_offset, size
+            _StoreSegment(
+                device_offset=piece.device_offset,
+                length=piece.length,
+                buf_offset=buf_offset + (piece.logical_start - file_offset),
             )
+            for piece in self._write_segments(file_offset, size)
         ]
         sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
         lib = self._backend._library()
@@ -444,18 +462,20 @@ class NDSHandle(FDGDSHandle):
             raise RuntimeError("NDS slab extents are not loaded")
         return extents
 
-    def _write_segments(
-        self, file_offset: int, size: int
-    ) -> list[tuple[int, int, int]]:
-        """Return (device_offset, segment_length, logical_start) per extent piece."""
-        segments: list[tuple[int, int, int]] = []
+    def _write_segments(self, file_offset: int, size: int) -> list[_WriteSegment]:
+        """Split ``[file_offset, file_offset + size)`` into extent pieces."""
+        segments: list[_WriteSegment] = []
         end = file_offset + size
         pos = file_offset
         while pos < end:
             ext = self._loaded_extents().extent_at(pos)
             seg_end = min(end, ext.logical + ext.length)
-            seg_len = seg_end - pos
-            device_off = ext.physical + (pos - ext.logical)
-            segments.append((device_off, seg_len, pos))
+            segments.append(
+                _WriteSegment(
+                    device_offset=ext.physical + (pos - ext.logical),
+                    length=seg_end - pos,
+                    logical_start=pos,
+                )
+            )
             pos = seg_end
         return segments

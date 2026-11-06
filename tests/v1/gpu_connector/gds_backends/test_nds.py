@@ -12,7 +12,11 @@ import torch
 from lmcache.v1.gpu_connector._gds_backends import available_backends, create_backend
 from lmcache.v1.gpu_connector.gds_backends.base import Submission
 from lmcache.v1.gpu_connector.gds_backends.fiemap import FileExtent, FileExtentMap
-from lmcache.v1.gpu_connector.gds_backends.nds import Backend, NDSHandle
+from lmcache.v1.gpu_connector.gds_backends.nds import (
+    Backend,
+    NDSHandle,
+    _StoreSegment,
+)
 
 
 def _mock_npu_for_stream(stream_id: int):
@@ -54,11 +58,17 @@ def _deferred_read_async(deferred: list):
 
 def _immediate_write_async(mock_lib):
     def _fn(dev_handle, buf_base, segments, result, stream, on_complete=None):
-        for device_off, seg_len, ptr_off in segments:
-            mock_lib.write(dev_handle, buf_base, seg_len, device_off, ptr_off)
+        for segment in segments:
+            mock_lib.write(
+                dev_handle,
+                buf_base,
+                segment.length,
+                segment.device_offset,
+                segment.buf_offset,
+            )
         if on_complete is not None:
             on_complete()
-        result.value = sum(seg_len for _, seg_len, _ in segments)
+        result.value = sum(segment.length for segment in segments)
 
     return _fn
 
@@ -282,8 +292,8 @@ def test_nds_handle_write_async_forwards_segments_and_on_complete(mock_library):
     wcall = mock_library.return_value.write_async.call_args
     assert wcall.args[0] == 88
     segments = wcall.args[2]
-    assert segments[0][0] == 0xA000 and segments[1][0] == 0xB000
-    assert segments[0][2] == 0 and segments[1][2] == 4096
+    assert segments[0] == _StoreSegment(0xA000, 4096, 0)
+    assert segments[1] == _StoreSegment(0xB000, 4096, 4096)
     assert wcall.kwargs["on_complete"] is not None
     fadvise.assert_called_once_with(handle._fd, 0, 8192, os.POSIX_FADV_DONTNEED)
     assert mock_library.return_value.write.call_count == 2
@@ -311,7 +321,7 @@ def test_nds_write_segments_use_buffer_offset_not_file_offset(mock_library):
     with patch("os.posix_fadvise"):
         handle.write_async(0x1000, 4096, 8192, 0, 7)
     segments = mock_library.return_value.write_async.call_args.args[2]
-    assert segments == [(0xA000 + 8192, 4096, 0)]
+    assert segments == [_StoreSegment(0xA000 + 8192, 4096, 0)]
 
 
 def test_nds_handle_close_idempotent_file_only():
