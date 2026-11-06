@@ -185,10 +185,23 @@ class Backend(FileGDSBackend):
             self._regions.pop(idx)
 
     def register_stream(self, raw_stream: int) -> None:
+        if raw_stream in self._registered_streams:
+            return
+        self._ensure_driver_open()
         self._registered_streams.add(raw_stream)
+        try:
+            self._library().register_stream(raw_stream)
+        except BaseException:
+            self._registered_streams.discard(raw_stream)
+            raise
 
     def deregister_stream(self, raw_stream: int) -> None:
-        self._registered_streams.discard(raw_stream)
+        if raw_stream not in self._registered_streams:
+            return
+        try:
+            self._library().deregister_stream(raw_stream)
+        finally:
+            self._registered_streams.discard(raw_stream)
 
     def _validate_stream(self, raw_stream: int) -> None:
         if raw_stream not in self._registered_streams:

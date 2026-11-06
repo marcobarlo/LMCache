@@ -205,6 +205,41 @@ def test_nds_handle_read_async_forwards_stream_and_result(mock_library):
     )
 
 
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_register_stream_forwards_and_is_idempotent(mock_library):
+    backend = Backend()
+    backend._ensure_driver_open = MagicMock()  # type: ignore[method-assign]
+    backend.register_stream(7)
+    backend.register_stream(7)
+    mock_library.return_value.register_stream.assert_called_once_with(7)
+    assert 7 in backend._registered_streams
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_register_stream_rolls_back_when_library_fails(mock_library):
+    backend = Backend()
+    backend._ensure_driver_open = MagicMock()  # type: ignore[method-assign]
+    mock_library.return_value.register_stream.side_effect = OSError("ctx")
+    with pytest.raises(OSError, match="ctx"):
+        backend.register_stream(7)
+    assert backend._registered_streams == set()
+
+
+@patch("lmcache.v1.gpu_connector.gds_backends.nds.Backend._library")
+def test_deregister_stream_destroys_context_before_forgetting_it(mock_library):
+    backend = Backend()
+    backend._registered_streams.add(7)
+    order: list[str] = []
+    mock_library.return_value.deregister_stream.side_effect = (
+        lambda stream: order.append(f"lib:{stream}")
+    )
+    backend.deregister_stream(7)
+    backend.deregister_stream(7)
+    assert order == ["lib:7"]
+    assert backend._registered_streams == set()
+    mock_library.return_value.deregister_stream.assert_called_once_with(7)
+
+
 def test_nds_handle_close_idempotent():
     backend = MagicMock()
     backend.deregister_handle = MagicMock()
