@@ -24,9 +24,11 @@
 #     Other platform tests remain relevant after backend implementations moved
 #     under platform/devices/.
 #
-# Opt-out: add a "force-ci" label to the PR on GitHub. Buildkite exposes
-# PR labels via BUILDKITE_PULL_REQUEST_LABELS; if "force-ci" is present
-# the filter is bypassed and the full pipeline runs.
+# Labels: BUILDKITE_PULL_REQUEST_LABELS may be comma-separated, space-separated,
+# or mixed. Commas are normalized to spaces and each label is matched as a
+# whole token. "npu" and "force-ci" are independent: neither implies the other.
+# "force-ci" bypasses the file filter. For the Ascend lane, a pull request
+# still needs its own "npu" or "full" label (a push to dev does not).
 #
 # Detection of "changed files":
 #   - PR builds  → diff against the merge-base with BUILDKITE_PULL_REQUEST_BASE_BRANCH.
@@ -327,6 +329,46 @@ _path_filter_get_changed_files() {
     return 1
 }
 
+# ── Pull request labels ───────────────────────────────────────
+
+# True when BUILDKITE_PULL_REQUEST_LABELS contains wanted as its own label.
+# Commas are turned into spaces first so "npu, force-ci" and "npu force-ci"
+# are the same two labels, not one string.
+_path_filter_pr_has_label() {
+    local wanted="${1:?label name is required}"
+    local labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+    local label
+    local IFS=$' \t\n\r'
+
+    labels="${labels//,/ }"
+    # Word-splitting is the token split after commas have become spaces.
+    # shellcheck disable=SC2086
+    for label in ${labels}; do
+        if [[ "${label}" == "${wanted}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ascend admission is separate from force-ci. A pull request needs "npu" or
+# "full" on its own. force-ci does not count, and npu does not skip the file filter.
+_path_filter_ascend_labels_allow() {
+    if [[ -z "${BUILDKITE_PULL_REQUEST:-}" || "${BUILDKITE_PULL_REQUEST}" == "false" ]]; then
+        return 0
+    fi
+    if [[ "${BUILDKITE_BRANCH:-}" == "dev" ]]; then
+        return 0
+    fi
+    if _path_filter_pr_has_label "npu"; then
+        return 0
+    fi
+    if _path_filter_pr_has_label "full"; then
+        return 0
+    fi
+    return 1
+}
+
 # ── Public entry point ────────────────────────────────────────
 
 # Returns 0 if the build can be safely skipped, non-zero otherwise.
@@ -334,9 +376,15 @@ _path_filter_get_changed_files() {
 should_skip_ci() {
     local pipeline_file="${1:-}"
     local pipeline_kind
+    pipeline_kind="$(_path_filter_pipeline_kind "$pipeline_file")"
 
-    # PR label opt-out: adding "force-ci" on GitHub forces a full run.
-    if [[ ",${BUILDKITE_PULL_REQUEST_LABELS:-}," == *",force-ci,"* ]]; then
+    if [[ "${pipeline_kind}" == "ascend" ]] && ! _path_filter_ascend_labels_allow; then
+        echo "path-filter: ascend PR has neither 'npu' nor 'full' label → SKIP" >&2
+        return 0
+    fi
+
+    # File-filter bypass. Does not grant the Ascend "npu" label.
+    if _path_filter_pr_has_label "force-ci"; then
         echo "path-filter: PR has 'force-ci' label → not skipping" >&2
         return 1
     fi
@@ -358,7 +406,6 @@ should_skip_ci() {
         return 1
     fi
 
-    pipeline_kind="$(_path_filter_pipeline_kind "$pipeline_file")"
     _path_filter_load_device_filter "$pipeline_kind"
 
     local has_non_trivial=0
