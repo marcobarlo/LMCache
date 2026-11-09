@@ -256,6 +256,23 @@ _path_filter_load_device_filter() {
         *) return 0 ;;
     esac
 
+    # Prefer an explicit trusted tree. The Ascend host bootstrap sets this to a
+    # clean clone of an allowlisted base branch so a pull request cannot replace
+    # the device filter that this file sources.
+    if [[ -n "${LMCACHE_CI_TRUSTED_ROOT:-}" ]]; then
+        filter_script="${LMCACHE_CI_TRUSTED_ROOT}/.buildkite/k3_tests/${pipeline_kind}/filter.sh"
+        if [[ ! -f "$filter_script" ]]; then
+            echo "path-filter: trusted tree has no ${pipeline_kind} filter; not loading the job checkout" >&2
+            return 0
+        fi
+        # shellcheck disable=SC1090
+        source "$filter_script"
+        if [[ -n "${FILTER_TRIGGER_CONDITION:-}" ]]; then
+            echo "path-filter: loaded trusted ${pipeline_kind} filter" >&2
+        fi
+        return 0
+    fi
+
     if [[ -n "${BUILDKITE_BUILD_CHECKOUT_PATH:-}" ]]; then
         repo_root="$BUILDKITE_BUILD_CHECKOUT_PATH"
     else
@@ -268,7 +285,7 @@ _path_filter_load_device_filter() {
     # shellcheck disable=SC1090
     source "$filter_script"
     if [[ -n "${FILTER_TRIGGER_CONDITION:-}" ]]; then
-        echo "path-filter: loaded ${filter_script} trigger: ${FILTER_TRIGGER_CONDITION}" >&2
+        echo "path-filter: loaded ${pipeline_kind} filter trigger: ${FILTER_TRIGGER_CONDITION}" >&2
     fi
 }
 
