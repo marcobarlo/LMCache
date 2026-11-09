@@ -1,10 +1,30 @@
 # Paste this into the Ascend910B Buildkite pipeline's "Steps" editor.
-# It uploads the NPU hardware pytest definition from the repo on the
-# maintainer's Ascend910B queue.
+# $$ is required: Buildkite turns it into $ before the agent shell runs.
+#
+# This step clones an allowlisted base branch and runs that copy of the
+# bootstrap. It does not execute shell scripts from the pull request checkout.
+# Update the steps editor after this file is on the base branch (dev/main).
 
 agents:
   queue: "Ascend910B"
 
 steps:
   - label: ":pipeline: Upload pipeline"
-    command: bash .buildkite/k3_tests/common_scripts/upload-pipeline.sh .buildkite/k3_tests/ascend/pipeline.yml
+    command: |
+      set -euo pipefail
+      base="$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-$${BUILDKITE_PIPELINE_DEFAULT_BRANCH:-dev}}"
+      case "$$base" in
+        dev|main|master) ;;
+        *)
+          echo "Ascend CI: refusing untrusted base branch" >&2
+          exit 1
+          ;;
+      esac
+      if [[ -z "$${BUILDKITE_REPO:-}" ]]; then
+        echo "Ascend CI: BUILDKITE_REPO is not set" >&2
+        exit 1
+      fi
+      work="$$(mktemp -d)"
+      trap 'rm -rf "$$work"' EXIT
+      git clone --quiet --depth 1 --branch "$$base" "$$BUILDKITE_REPO" "$$work/src"
+      bash "$$work/src/.buildkite/k3_tests/ascend/trusted-bootstrap.sh"

@@ -1,9 +1,13 @@
 # Ascend 910B NPU pytest lane (multiprocess + P2P).
+#
+# The test command reloads run-in-container.sh from an allowlisted base branch.
+# $$ is Buildkite's escape so the agent shell receives $.
+# Plugin checkout, proxy, and container network come from the agent environment,
+# not from this file.
 
 env:
   LMCACHE_TRACK_USAGE: "false"
   SOC_VERSION: "Ascend910B4"
-  LMCACHE_ASCEND_CHECKOUT_PATH: "/var/lib/jenkins/lmcache-ascend-ci"
 
 steps:
   - label: "Ascend NPU Unit Tests (910B)"
@@ -11,11 +15,29 @@ steps:
     timeout_in_minutes: 60
     concurrency: 1
     concurrency_group: "lmcache/ascend-910b"
-    command: bash .buildkite/k3_tests/ascend/run-in-container.sh
+    command: |
+      set -euo pipefail
+      base="$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-$${BUILDKITE_PIPELINE_DEFAULT_BRANCH:-dev}}"
+      case "$$base" in
+        dev|main|master) ;;
+        *)
+          echo "Ascend CI: refusing untrusted base branch" >&2
+          exit 1
+          ;;
+      esac
+      if [[ -z "$${BUILDKITE_REPO:-}" ]]; then
+        echo "Ascend CI: BUILDKITE_REPO is not set" >&2
+        exit 1
+      fi
+      work="$$(mktemp -d)"
+      trap 'rm -rf "$$work"' EXIT
+      git clone --quiet --depth 1 --branch "$$base" "$$BUILDKITE_REPO" "$$work/src"
+      bash "$$work/src/.buildkite/k3_tests/ascend/run-in-container.sh"
 
     agents:
       queue: "Ascend910B"
 
     artifact_paths:
-      - "ascend-junit.xml"
-      - "ascend-ci-artifacts/**/*"
+      - "ascend-ci-artifacts/junit/ascend-junit.xml"
+      - "ascend-ci-artifacts/host-npu-smi.txt"
+      - "ascend-ci-artifacts/failure.log"

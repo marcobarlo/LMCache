@@ -1,129 +1,121 @@
-# Ascend 910B Buildkite lane — components and outbound traffic
+# Ascend 910B Buildkite lane — trust boundary and outbound traffic
 
-This lane runs on a **self-hosted** Ascend host. The **Buildkite agent** is the
-long-lived controller on that machine: it talks to Buildkite Cloud, prepares the
-job checkout, and runs `run-in-container.sh`. It is **not** a receive-only
-Jenkins-style controller; **logs, job metadata, and artifacts leave the host**
-toward Buildkite (and git/package pulls leave toward the public internet unless
-you mirror everything on the intranet).
+This lane runs on a **self-hosted** Ascend host. The **Buildkite agent** talks to
+Buildkite, checks out the pull request, and starts Docker. Logs and the
+allowlisted artifacts leave the host toward Buildkite. Do not put internal
+host names, proxy addresses, or checkout paths in this file or in `pipeline.yml`.
+
+## Trust boundary
+
+Host shell is not taken from the pull request.
+
+1. The Buildkite steps editor runs `buildkite-pipeline.yml`: clone an allowlisted
+   base branch (`dev`, `main`, or `master`) and execute `trusted-bootstrap.sh`
+   from that clone.
+2. The bootstrap uploads `pipeline.yml` from the same clone. Path filtering
+   sources `filter.sh` from that clone (`LMCACHE_CI_TRUSTED_ROOT`), not from
+   the pull request.
+3. The test step clones the base branch again and runs that copy of
+   `run-in-container.sh`. The pull request tree is only the code under test.
+
+`dev` / `main` must be protected. A change to these scripts does nothing on the
+agent until it is merged, and nothing at all until the steps editor uses the
+bootstrap. Leave the old `bash .buildkite/.../upload-pipeline.sh` command in
+place and a pull request can still replace the host shell.
 
 ## Component diagram
 
 ```mermaid
 flowchart TB
-  subgraph internet["Outside / corporate egress"]
-    BK["Buildkite Cloud<br/>(agent.buildkite.com, API, artifact storage)"]
-    GH["GitHub<br/>(LMCache + LMCache-Ascend + submodules)"]
-    QUAY["quay.io<br/>(vllm-ascend container image)"]
-    PYPI["PyPI / mirrors<br/>(pip during job)"]
-    PROXY["Optional HTTP proxy<br/>(e.g. proxyhk → host.docker.internal:3128)"]
+  subgraph internet["Outside the host"]
+    BK["Buildkite Cloud<br/>(agent API and artifact storage)"]
+    GH["GitHub<br/>(LMCache base branch, PR, LMCache-Ascend)"]
+    QUAY["Container registry<br/>(vllm-ascend image)"]
+    PYPI["Package index<br/>(pip during the job)"]
+    PROXY["Optional HTTP proxy<br/>(agent env, not stored in git)"]
   end
 
-  subgraph github_side["GitHub (trigger path)"]
-    PR["PR / push on LMCache"]
-  end
-
-  PR -->|"webhook (GitHub → Buildkite)"| BK
-  BK -->|"job assignment + pipeline YAML"| AGENT
-
-  subgraph ascend_host["Ascend 910B host (intranet)"]
+  subgraph ascend_host["Ascend host"]
     AGENT["buildkite-agent<br/>queue: Ascend910B"]
-    CHECKOUT["Job checkout<br/>BUILDKITE_BUILD_CHECKOUT_PATH"]
-    PLUGIN["LMCache-Ascend tree<br/>(clone or LMCACHE_ASCEND_CHECKOUT_PATH)"]
-    SCRIPT["run-in-container.sh"]
+    TRUST["Base-branch clone<br/>trusted-bootstrap.sh + run-in-container.sh"]
+    CHECKOUT["PR checkout<br/>test input only"]
     DOCKER["Docker engine"]
-    DRV["Ascend driver + Davinci devices<br/>(local only)"]
-    ART["ascend-ci-artifacts/<br/>logs, JUnit, npu-smi"]
+    NET["Restricted Docker network<br/>ASCEND_CI_DOCKER_NETWORK"]
+    DRV["Ascend driver + selected Davinci nodes"]
+    ART["Allowlisted artifacts<br/>JUnit, redacted npu-smi, failure.log"]
 
-    AGENT --> CHECKOUT
-    AGENT --> SCRIPT
-    SCRIPT --> PLUGIN
-    SCRIPT --> DOCKER
+    AGENT --> TRUST
+    TRUST --> CHECKOUT
+    TRUST --> DOCKER
+    DOCKER --> NET
     DOCKER --> DRV
-    SCRIPT --> ART
+    TRUST --> ART
   end
 
-  subgraph container["Docker: quay.io/ascend/vllm-ascend"]
-    INNER["Inner script: pip install -e LMCache + LMCache-Ascend,<br/>pytest, ascend-junit.xml"]
+  subgraph container["Test container"]
+    INNER["Copy sources to container-local disk,<br/>pip install -e, pytest"]
     DOCKER --> INNER
   end
 
-  INNER -->|"bind mount rw"| CHECKOUT
-  INNER -->|"bind mount rw"| PLUGIN
-  INNER -->|"writes JUnit"| CHECKOUT
-
-  AGENT -->|"outbound: poll, logs, artifacts, status"| BK
-  AGENT -->|"outbound: git fetch checkout"| GH
-  SCRIPT -->|"outbound: git clone/submodule (if auto-clone)"| GH
-  DOCKER -->|"outbound: docker pull (if missing image)"| QUAY
-  INNER -->|"outbound: pip (often via proxy)"| PROXY
+  INNER -->|"read-only source mounts, no .git"| CHECKOUT
+  AGENT -->|"job poll, logs, allowlisted artifacts"| BK
+  TRUST -->|"git clone of the base branch"| GH
+  DOCKER -->|"image pull on the host"| QUAY
+  INNER -->|"pip, only if the restricted network allows it"| PROXY
   PROXY --> PYPI
-  INNER -.->|"direct pip if no proxy"| PYPI
 
   classDef egress fill:#ffe6e6,stroke:#c00,stroke-width:2px
   class BK,GH,QUAY,PYPI,PROXY egress
 ```
 
-## Pipeline steps (logical)
+## What leaves the host
 
-```mermaid
-sequenceDiagram
-  participant GH as GitHub
-  participant BK as Buildkite Cloud
-  participant A as buildkite-agent
-  participant H as Host scripts
-  participant D as Docker / container
-  participant N as NPU (local)
+| Source | Destination | When | Data |
+|--------|-------------|------|------|
+| **buildkite-agent** | **Buildkite** | While the agent is registered and during jobs | Job poll, **stdout/stderr**, annotations, **allowlisted artifacts** |
+| **git** | **GitHub** | Start of the job, and the trusted clone of the base branch | The pipeline repo. The plugin is not fetched when `LMCACHE_ASCEND_CHECKOUT_PATH` is set |
+| **Docker** | **Image registry** | Missing image | The pinned vLLM-Ascend image |
+| **Container `pip`** | **Package index** | Install step | Python packages. HTTP proxy only if the agent set `ASCEND_CI_HTTP_PROXY` |
+| **pytest** | **Buildkite Test Analytics** | Only if `BUILDKITE_ANALYTICS_TOKEN` is set | Test timing metadata |
 
-  GH->>BK: PR label npu/full or dev branch
-  BK->>A: Assign job (queue Ascend910B)
-  A->>GH: Clone/fetch LMCache checkout
-  A->>H: upload-pipeline.sh + path-filter / filter.sh
-  A->>H: run-in-container.sh
-  H->>GH: Optional clone LMCache-Ascend + submodules
-  H->>D: docker run (image from quay.io)
-  D->>GH: pip may reach PyPI (or proxy)
-  D->>N: NPU tests (no network)
-  D->>H: ascend-junit.xml on checkout volume
-  A->>BK: Stream logs + upload artifacts / job result
-  Note over A,BK: Outbound from Ascend host
-  BK->>GH: Commit check status (Buildkite integration,<br/>not the agent binary directly)
-```
+`npu-smi info` is part of the log and of `host-npu-smi.txt`. IPv4, IPv6, and
+MAC addresses are redacted. The health table, including PCI bus ids, is kept.
 
-## What leaves the Ascend machine (outbound)
+## What the container can touch
 
-| Source on host | Destination | When | Data |
-|----------------|-------------|------|------|
-| **buildkite-agent** | **Buildkite Cloud** | Always while registered / during jobs | Job poll, **stdout/stderr log stream**, step annotations, **artifact uploads** (e.g. JUnit, failure logs), agent heartbeat |
-| **buildkite-agent** (checkout hook) | **GitHub** | Start of job | **Git** fetch/clone of **LMCache** at build commit |
-| **run-in-container.sh** (host `git`) | **GitHub** | If `LMCACHE_ASCEND_CHECKOUT_PATH` unset | **Git** clone/fetch **LMCache-Ascend** + **submodule** updates |
-| **Docker** | **quay.io** | First use or `docker pull` | **Container image** layers (`vllm-ascend:v0.26.0rc1`) |
-| **Container `pip`** | **PyPI / mirror** | `pip install` test deps + editable installs | **Python packages** (requirements/*.txt); may go via **HTTP proxy** when `proxyhk.huawei.com` resolves |
-| **pytest** (optional) | **Buildkite Test Analytics** | Only if `BUILDKITE_ANALYTICS_TOKEN` set | Test timing metadata (plugin present in requirements) |
+| Mount or device | Mode |
+|-----------------|------|
+| Staged LMCache and LMCache-Ascend trees | Read-only. `.git` is not included. The container copies them onto its own disk before `pip install -e` |
+| JUnit output directory | Read-write, and the only job directory mounted into the container |
+| Ascend driver and DCMI | Read-only. Required for the NPU |
+| Davinci nodes listed in `ASCEND_RT_VISIBLE_DEVICES`, plus the manager nodes | Device passthrough |
 
-## What stays on the Ascend host (no intended egress)
+The container runs as root with `no-new-privileges`. It does not receive
+`SYS_PTRACE`. Shared memory is `--shm-size=8g` unless the agent sets
+`ASCEND_CI_IPC_HOST=1`. The host CA trust store is not mounted; set
+`ASCEND_CI_CA_CERT_FILE` to one file if a proxy intercepts TLS.
 
-| Component | Notes |
-|-----------|--------|
-| Ascend driver, `npu-smi`, Davinci device I/O | Local kernel / firmware path |
-| NPU compute during pytest | On-device |
-| `ascend-ci-artifacts/` on disk | Local until agent uploads copies to Buildkite |
-| LMCache / LMCache-Ascend source trees | Local bind mounts; only **git/pip** pull content in |
+## Egress
 
-## Controller vs “CI container”
+On Buildkite the script refuses to start the container unless
+`ASCEND_CI_DOCKER_NETWORK` names an existing custom Docker network. `host`,
+`bridge`, and `none` are rejected. The script cannot install firewall rules.
+The agent owner has to create that network and limit its egress (package
+index, registry, and the proxy if pip needs one).
+
+`ASCEND_CI_ALLOW_OPEN_EGRESS=1` skips the check. Set it only in the agent
+environment, and only when the host has no intranet path worth isolating.
+Do not put that opt-out, a proxy URL, or a checkout path in `pipeline.yml`.
+
+Local runs outside Buildkite do not require the network variable, so the same
+script can still be used on a development machine.
+
+## Controller vs test container
 
 | Role | Process | Outbound? |
 |------|---------|-----------|
-| **Controller** | `buildkite-agent` on the 910B host | **Yes** — primary egress to Buildkite; triggers checkout from GitHub |
-| **Job runner** | `run-in-container.sh` + **Docker** | **Yes** — git clone plugin, image pull, pip; pytest mostly local |
-| **Test environment** | Container inner bash | **Mostly no** for NPU work; **yes** for pip (and any test that opens network sockets) |
-
-## Reducing outbound (operator notes)
-
-- Mirror **quay.io** image and set `ASCEND_CI_IMAGE` to an internal registry.
-- Pre-populate **`LMCACHE_ASCEND_CHECKOUT_PATH`** and skip auto-clone.
-- Use an **internal PyPI mirror** and point `pip` / proxy env at it.
-- **Buildkite** still requires agent → cloud connectivity unless you run a self-hosted Buildkite stack (out of scope for this repo layout).
-- This lane does **not** run the old intranet-only **Jenkins** `github_status.py` path; status flows **Buildkite → GitHub** when the pipeline is linked to the repo.
+| **Controller** | `buildkite-agent` | Yes — Buildkite, and git fetch of the pipeline repo |
+| **Trusted host runner** | Base-branch `run-in-container.sh` | Yes — Docker, and a plugin clone only when no pre-provisioned checkout is set |
+| **Tests** | Container | Only through the restricted network, for pip |
 
 See also: [`BK_WEB_SETUP.md`](BK_WEB_SETUP.md), [`run-in-container.sh`](run-in-container.sh).
