@@ -119,3 +119,13 @@ script can still be used on a development machine.
 | **Tests** | Container | Only through the restricted network, for pip |
 
 See also: [`BK_WEB_SETUP.md`](BK_WEB_SETUP.md), [`run-in-container.sh`](run-in-container.sh).
+
+## Verification PR (fork)
+
+To exercise this lane on a self-hosted **`Ascend910B`** agent (your Buildkite org + queue **`Ascend910B`**):
+
+1. Open a PR into **`dev`** that touches `.buildkite/k3_tests/ascend/` (for example branch **`ci/test-ascend-trigger-2`**).
+2. Add GitHub label **`npu`** (or **`full`**) on the PR.
+3. Confirm Buildkite runs pipeline **`lmcache-ascend-910b`** (upload step + Ascend pytest).
+
+Test run: 2026-11-02 (Buildkite smoke after agent registration).
