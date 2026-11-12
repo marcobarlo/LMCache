@@ -252,7 +252,7 @@ class Backend(FileGDSBackend):
             raise RuntimeError("buffer I/O exceeds registered region")
 
     def _library(self):
-        from lmcache_ascend.v1.gds.openeuler_nds_library import (
+        from lmcache.v1.gpu_connector.gds_backends._openeuler_nds_library import (
             get_openeuler_nds_library,
         )
 
