@@ -63,6 +63,18 @@ That shape is what LMCache's format detector recognizes as format 17
 (opaque sub-planes). The edit does not copy or pad bytes; the transfer kernel
 checks alignment, row size, and plane count when store/load runs.
 
+The per-block payload and the physical dim-0 step are independent. A legacy
+contiguous slice has `stride(0) * itemsize == payload_bytes`. Qwen4 GDN uses
+the same rule when each block is dense but `stride(0) * itemsize` is the
+shared slab stride and is larger than that state's payload. The output shape
+covers only the payload (`width = payload_bytes / block_size`); its dim-0
+stride retains the slab step, so the bytes between conv/SSM and the next GDN
+block are not part of the plane. Planes that overlap, have a stride smaller
+than their payload, or whose payload does not divide the scheduler block are
+rejected. A current V2 packed page is not handled here: its conv stride equals
+`page_size_bytes`, so the packed page rule above emits format 2 for the whole
+padded page.
+
 ### 2. Sub-paged full attention
 
 vLLM unifies page sizes across hybrid groups by inflating the attention

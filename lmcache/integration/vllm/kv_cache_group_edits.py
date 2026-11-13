@@ -338,40 +338,92 @@ class _MambaSlicePlaneEdit(KVCacheGroupEdit):
     ``num_blocks`` and require ``spec.block_size`` (scheduler block size) to
     divide that per-block byte count; otherwise ``width`` is not integral and
     the edit does not match (``apply`` raises if forced).
+
+    Qwen4 GDN registers the same two states as dense regions inside a shared
+    slab. Each region's payload is contiguous, but its dim-0 stride is the
+    slab's ``state_stride`` and is larger than the payload; the skipped bytes
+    belong to a sibling cache. The payload and the physical block step are
+    therefore independent. Each plane is still
+    ``[num_blocks, block_size, 1, payload_bytes / block_size]``, while its
+    dim-0 stride stays ``stride(0) * itemsize``. A contiguous legacy slice is
+    the case where those two quantities are equal. A packed page, whose conv
+    stride equals ``page_size_bytes``, remains owned by
+    :class:`_MambaPageViewEdit`.
     """
 
     name = "mamba-slice-planes"
 
     @staticmethod
-    def _dense_block_bytes(state: torch.Tensor) -> int | None:
-        """Dense per-block byte size, or ``None`` if the slice is not one."""
-        num_blocks = int(state.shape[0])
-        if num_blocks <= 0 or not state.is_contiguous():
+    def _plane_geometry(state: torch.Tensor) -> tuple[int, int] | None:
+        """Return ``(payload_bytes, stride_bytes)`` for one dense-inner plane.
+
+        ``None`` means the block axis is empty, one block's elements are not
+        densely packed, or the physical step would make consecutive blocks
+        overlap.
+        """
+        if state.ndim < 1 or int(state.shape[0]) <= 0:
             return None
-        return int(state.numel()) * int(state.element_size()) // num_blocks
+        block = state[0]
+        if not block.is_contiguous():
+            return None
+        payload_bytes = int(block.numel()) * int(state.element_size())
+        stride_bytes = int(state.stride(0)) * int(state.element_size())
+        if payload_bytes <= 0 or stride_bytes < payload_bytes:
+            return None
+        return payload_bytes, stride_bytes
+
+    @staticmethod
+    def _planes_are_disjoint(states: list[torch.Tensor]) -> bool:
+        """Return whether shared-storage planes keep disjoint block ranges."""
+        geometries = []
+        for state in states:
+            geometry = _MambaSlicePlaneEdit._plane_geometry(state)
+            if geometry is None:
+                return False
+            geometries.append(geometry)
+        for index, first in enumerate(states):
+            first_payload, first_stride = geometries[index]
+            first_storage = first.untyped_storage().data_ptr()
+            first_start = int(first[0].data_ptr())
+            for other, (other_payload, other_stride) in zip(
+                states[index + 1 :], geometries[index + 1 :], strict=True
+            ):
+                if other.untyped_storage().data_ptr() != first_storage:
+                    continue
+                if first_stride != other_stride:
+                    return False
+                other_start = int(other[0].data_ptr())
+                ranges_overlap = (
+                    first_start < other_start + other_payload
+                    and other_start < first_start + first_payload
+                )
+                if ranges_overlap:
+                    return False
+        return True
 
     @staticmethod
     def _uint8_plane(state: torch.Tensor, block_size: int) -> torch.Tensor:
-        """Re-view one state slice as one uint8 plane."""
-        nbytes = _MambaSlicePlaneEdit._dense_block_bytes(state)
-        if nbytes is None:
+        """Re-view one state as one uint8 plane, preserving its block stride."""
+        geometry = _MambaSlicePlaneEdit._plane_geometry(state)
+        if geometry is None:
             raise ValueError(
-                "Mamba state must be a non-empty contiguous slice, "
+                "Mamba state blocks must be non-empty and dense, with a "
+                "dim-0 stride at least as large as one block, "
                 f"got shape {tuple(state.shape)} stride {tuple(state.stride())}"
             )
-        if nbytes % block_size != 0:
+        payload_bytes, stride_bytes = geometry
+        if payload_bytes % block_size != 0:
             raise ValueError(
                 f"scheduler block size {block_size} does not divide the "
-                f"{nbytes}-byte state block"
+                f"{payload_bytes}-byte state block"
             )
-        width = nbytes // block_size
-        num_blocks = int(state.shape[0])
-        raw = state.view(torch.uint8)
-        base = int(raw.storage_offset())
-        return raw.as_strided(
-            (num_blocks, block_size, 1, width),
-            (nbytes, width, width, 1),
-            storage_offset=base,
+        width = payload_bytes // block_size
+        raw = torch.empty(0, dtype=torch.uint8, device=state.device)
+        return raw.set_(
+            state.untyped_storage(),
+            int(state.storage_offset()) * int(state.element_size()),
+            (int(state.shape[0]), block_size, 1, width),
+            (stride_bytes, width, width, 1),
         )
 
     def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
@@ -387,11 +439,11 @@ class _MambaSlicePlaneEdit(KVCacheGroupEdit):
             return False
         block_counts: set[int] = set()
         for state in kv_cache:
-            nbytes = self._dense_block_bytes(state)
-            if nbytes is None or nbytes % block_size != 0:
+            geometry = self._plane_geometry(state)
+            if geometry is None or geometry[0] % block_size != 0:
                 return False
             block_counts.add(int(state.shape[0]))
-        if len(block_counts) != 1:
+        if len(block_counts) != 1 or not self._planes_are_disjoint(kv_cache):
             return False
         stride_bytes = kv_cache[0].stride(0) * kv_cache[0].element_size()
         return stride_bytes != spec.page_size_bytes

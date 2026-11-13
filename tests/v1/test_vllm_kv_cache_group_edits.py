@@ -75,6 +75,7 @@ class _Spec:
     block_size: int
     page_size_bytes: int
     real_page_size_bytes: int | None = None
+    page_size_padded: int | None = None
     mamba_cache_mode: str = "align"
 
 
@@ -483,10 +484,13 @@ def test_mamba_slice_planes_on_slice_strided_list(edits):
     assert len(planes) == 2
     widths = [int(plane.shape[-1]) for plane in planes]
     assert widths[0] != widths[1]
-    for plane in planes:
+    for plane, state in zip(planes, caches, strict=True):
         assert plane.dtype == torch.uint8
         assert plane.ndim == 4
         assert int(plane.shape[2]) == 1
+        payload = int(state[0].numel()) * int(state.element_size())
+        assert int(plane.stride(0)) == payload
+        assert int(plane.reshape(plane.shape[0], -1).shape[1]) == payload
 
 
 def test_mamba_slice_planes_skip_indivisible_slice(edits):
@@ -626,6 +630,201 @@ def test_mamba_page_view_handles_nonzero_storage_offset(edits):
     )
     torch.testing.assert_close(viewed.reshape(NUM_LOGICAL_BLOCKS, -1), expected)
     assert int(viewed.reshape(-1)[0]) != -1
+
+
+def _v2_padded_mamba_kv_cache() -> tuple[list[torch.Tensor], int, int, torch.Tensor]:
+    """Qwen3.5-4B TP1 V2 geometry: conv | ssm | padded suffix."""
+    num_blocks = 2
+    block_size = 384
+    page_bytes = 1_572_864
+    conv_bytes = 49_152
+    ssm_bytes = 1_048_576
+    elem = torch.finfo(torch.bfloat16).bits // 8
+    storage = torch.full((num_blocks * page_bytes,), 3, dtype=torch.uint8)
+    for block in range(num_blocks):
+        base = block * page_bytes
+        storage[base : base + conv_bytes] = 1
+        storage[base + conv_bytes : base + conv_bytes + ssm_bytes] = 2
+    states = storage.view(torch.bfloat16)
+    page_elems = page_bytes // elem
+    conv_state = states.as_strided((num_blocks, 3, 8192), (page_elems, 8192, 1))
+    ssm_state = states.as_strided(
+        (num_blocks, 32, 128, 128),
+        (page_elems, 16384, 128, 1),
+        storage_offset=conv_bytes // elem,
+    )
+    return [conv_state, ssm_state], block_size, page_bytes, storage
+
+
+def test_v2_padded_page_uses_full_page_view(edits):
+    """Current V2 exposes the padded page as ``page_size_bytes``.
+
+    Conv and SSM strides equal that padded size, so the packed page rule owns
+    the layer and the registered view includes the suffix padding.
+    """
+    caches, block_size, page_bytes, storage = _v2_padded_mamba_kv_cache()
+    spec = _mamba_spec(page_bytes)
+    spec.block_size = block_size
+    page_edit = edits._MambaPageViewEdit()
+    slice_edit = edits._MambaSlicePlaneEdit()
+    assert page_edit.matches(spec, caches)
+    assert not slice_edit.matches(spec, caches)
+
+    viewed = page_edit.apply(spec, caches, {})
+    elems_per_page = page_bytes // viewed.element_size()
+    assert tuple(viewed.shape) == (
+        storage.numel() // page_bytes,
+        2,
+        block_size,
+        1,
+        elems_per_page // (2 * block_size),
+    )
+    expected = storage.view(viewed.dtype).reshape(viewed.shape[0], elems_per_page)
+    torch.testing.assert_close(viewed.reshape(viewed.shape[0], -1), expected)
+    flat = viewed.reshape(viewed.shape[0], -1).view(torch.uint8)
+    assert bool(torch.all(flat[0, :49_152] == 1).item())
+    assert bool(torch.all(flat[0, 49_152 : 49_152 + 1_048_576] == 2).item())
+    assert bool(torch.all(flat[0, 49_152 + 1_048_576 :] == 3).item())
+
+
+def _qwen4_gdn_slab(
+    *,
+    prefix_bytes: int = 0,
+    block_size: int = 128,
+    ssm_blocks: int | None = None,
+) -> tuple[list[torch.Tensor], _Spec, torch.Tensor, dict[str, int]]:
+    """Qwen4 GDN conv/SSM regions inside one shared 65536-byte slab."""
+    num_blocks = 4
+    state_stride = 65536
+    conv_shape = (64, 4)
+    ssm_shape = (128, 128)
+    element_size = torch.finfo(torch.bfloat16).bits // 8
+    conv_bytes = 64 * 4 * element_size
+    ssm_bytes = 128 * 128 * element_size
+    backing = torch.full(
+        (prefix_bytes + num_blocks * state_stride,), 0xAB, dtype=torch.uint8
+    )
+    for block in range(num_blocks):
+        base = prefix_bytes + block * state_stride
+        backing[base : base + conv_bytes] = 1 + block
+        backing[base + conv_bytes : base + conv_bytes + ssm_bytes] = 11 + block
+    typed = backing.view(torch.bfloat16)
+    conv = typed.as_strided(
+        (num_blocks, *conv_shape),
+        (state_stride // element_size, 4, 1),
+        storage_offset=prefix_bytes // element_size,
+    )
+    ssm_count = num_blocks if ssm_blocks is None else ssm_blocks
+    ssm = typed.as_strided(
+        (ssm_count, *ssm_shape),
+        (state_stride // element_size, 128, 1),
+        storage_offset=(prefix_bytes + conv_bytes) // element_size,
+    )
+    spec = _mamba_spec(conv_bytes + ssm_bytes)
+    spec.block_size = block_size
+    sizes = {
+        "prefix_bytes": prefix_bytes,
+        "state_stride": state_stride,
+        "conv_bytes": conv_bytes,
+        "ssm_bytes": ssm_bytes,
+        "num_blocks": num_blocks,
+    }
+    return [conv, ssm], spec, backing, sizes
+
+
+def test_qwen4_gdn_slab_registers_payload_only_planes(edits):
+    """Region-strided conv and SSM become two format-17 planes.
+
+    Each plane contains only its own payload. The shared slab stride remains
+    the dim-0 step, and the gap after SSM stays outside both views.
+    """
+    prefix_bytes = 64
+    caches, spec, backing, sizes = _qwen4_gdn_slab(prefix_bytes=prefix_bytes)
+    page_edit = edits._MambaPageViewEdit()
+    slice_edit = edits._MambaSlicePlaneEdit()
+    assert not page_edit.matches(spec, caches)
+    assert slice_edit.matches(spec, caches)
+
+    config = _Config(
+        kv_cache_groups=[_Group(layer_names=["gdn.0"], kv_cache_spec=spec)]
+    )
+    edited = edits.apply_kv_cache_group_edits(config, {"gdn.0": caches}, {})
+    planes = edited["gdn.0"]
+    assert len(planes) == 2
+    conv_plane, ssm_plane = planes
+    block_size = int(spec.block_size)
+    conv_width = sizes["conv_bytes"] // block_size
+    ssm_width = sizes["ssm_bytes"] // block_size
+    assert tuple(conv_plane.shape) == (sizes["num_blocks"], block_size, 1, conv_width)
+    assert tuple(ssm_plane.shape) == (sizes["num_blocks"], block_size, 1, ssm_width)
+    assert int(conv_plane.stride(0)) == sizes["state_stride"]
+    assert int(ssm_plane.stride(0)) == sizes["state_stride"]
+    assert int(conv_plane.storage_offset()) == prefix_bytes
+    assert int(ssm_plane.storage_offset()) == prefix_bytes + sizes["conv_bytes"]
+    assert conv_plane.untyped_storage().data_ptr() == backing.untyped_storage().data_ptr()
+    for block in range(sizes["num_blocks"]):
+        base = prefix_bytes + block * sizes["state_stride"]
+        torch.testing.assert_close(
+            conv_plane[block].reshape(-1),
+            backing[base : base + sizes["conv_bytes"]],
+        )
+        torch.testing.assert_close(
+            ssm_plane[block].reshape(-1),
+            backing[base + sizes["conv_bytes"] : base + sizes["conv_bytes"] + sizes["ssm_bytes"]],
+        )
+        gap = backing[
+            base + sizes["conv_bytes"] + sizes["ssm_bytes"] : base + sizes["state_stride"]
+        ]
+        assert bool(torch.all(gap == 0xAB).item())
+    assert bool(torch.all(backing[:prefix_bytes] == 0xAB).item())
+
+    # First Party
+    from lmcache.lmcache_native import EngineKVFormat
+    from lmcache.utils import EngineType
+    from lmcache.v1.gpu_connector.kv_format.detection import detect_format
+
+    fmt, _normalized = detect_format([planes], EngineType.VLLM)
+    assert fmt == EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
+
+
+@pytest.mark.parametrize(
+    ("mutate", "label"),
+    [
+        ("inner-hole", "inner stride"),
+        ("short-stride", "block stride"),
+        ("unequal-blocks", "block counts"),
+        ("indivisible", "block size"),
+        ("overlap", "overlapping"),
+    ],
+)
+def test_qwen4_gdn_slab_rejects_malformed_planes(edits, mutate, label):
+    """Malformed region strides must not be registered as transferable planes."""
+    caches, spec, _backing, sizes = _qwen4_gdn_slab()
+    conv, ssm = caches
+    if mutate == "inner-hole":
+        conv = conv.as_strided(conv.shape, (conv.stride(0), 8, 1), conv.storage_offset())
+        caches = [conv, ssm]
+    elif mutate == "short-stride":
+        conv = conv.as_strided(
+            conv.shape,
+            (sizes["conv_bytes"] // conv.element_size() - 1, 4, 1),
+            conv.storage_offset(),
+        )
+        caches = [conv, ssm]
+    elif mutate == "unequal-blocks":
+        _caches, spec, _backing, _sizes = _qwen4_gdn_slab(ssm_blocks=sizes["num_blocks"] - 1)
+        caches = _caches
+    elif mutate == "indivisible":
+        spec.block_size += 1
+    else:
+        caches = [conv, conv]
+
+    assert not edits._MambaSlicePlaneEdit().matches(spec, caches)
+    config = _Config(
+        kv_cache_groups=[_Group(layer_names=["gdn.0"], kv_cache_spec=spec)]
+    )
+    edited = edits.apply_kv_cache_group_edits(config, {"gdn.0": caches}, {})
+    assert edited["gdn.0"] is caches, label
 
 
 def _subpaged_kv_planes(
