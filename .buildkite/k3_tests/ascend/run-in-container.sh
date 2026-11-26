@@ -24,6 +24,10 @@ SOC_VERSION="${SOC_VERSION:-Ascend910B4}"
 ASCEND_PLUGIN_REF="${LMCACHE_ASCEND_REF:-main}"
 ASCEND_PLUGIN_REPO="${LMCACHE_ASCEND_REPO:-git@github.com:LMCache/LMCache-Ascend.git}"
 ASCEND_PLUGIN_ROOT=""
+# ASCEND_CI_DIRECT=1: run the test step in place inside the agent container
+# (which is the NPU container: same image, CANN env, device nodes). No docker,
+# no bind mounts. Set by the agent's unit file, inherited by jobs.
+ASCEND_CI_DIRECT="${ASCEND_CI_DIRECT:-0}"
 ARTIFACT_DIR="${REPO_ROOT}/ascend-ci-artifacts"
 STAGE_DIR=""
 INNER=""
@@ -56,6 +60,9 @@ cleanup() {
     local status=$?
     if [[ -n "${STAGE_DIR}" && -d "${STAGE_DIR}" ]]; then
         rm -rf "${STAGE_DIR}" 2>/dev/null || true
+    fi
+    if [[ "${ASCEND_CI_DIRECT:-0}" == "1" ]]; then
+        rm -f /ci-out 2>/dev/null || true
     fi
     if [[ -n "${INNER}" && -f "${INNER}" ]]; then
         rm -f "${INNER}" 2>/dev/null || true
@@ -97,7 +104,16 @@ on_buildkite() {
 
 mkdir -p "${ARTIFACT_DIR}/junit"
 chmod 1777 "${ARTIFACT_DIR}/junit" || true
-command -v docker >/dev/null 2>&1 || fail "docker is required on the Ascend agent"
+case "${ASCEND_CI_DIRECT}" in
+    0|1) ;;
+    *) fail "ASCEND_CI_DIRECT must be 0 or 1" ;;
+esac
+
+if [[ "${ASCEND_CI_DIRECT}" == "1" ]]; then
+    log "Direct mode: tests run inside the agent container (no docker)"
+else
+    command -v docker >/dev/null 2>&1 || fail "docker is required on the Ascend agent"
+fi
 command -v git >/dev/null 2>&1 || fail "git is required to prepare LMCache-Ascend"
 command -v tar >/dev/null 2>&1 || fail "tar is required to stage the test sources"
 
@@ -182,7 +198,19 @@ stage_lmcache_sources() {
 
 prepare_ascend_plugin_checkout
 
-STAGE_DIR="$(mktemp -d)"
+if [[ "${ASCEND_CI_DIRECT}" == "1" ]]; then
+    # Stage into the real paths the inner script expects instead of bind
+    # mounts. /src/LMCache must be a real directory: the inner script does
+    # `cp -a /src/LMCache /tmp/LMCache`, and -a preserves a top-level
+    # symlink instead of copying the tree. /ci-out points at the junit
+    # artifact dir so the file lands where artifact_paths globs it.
+    rm -rf /src /ci-out
+    mkdir -p /src
+    STAGE_DIR="/src"
+    ln -s "${ARTIFACT_DIR}/junit" /ci-out
+else
+    STAGE_DIR="$(mktemp -d)"
+fi
 stage_lmcache_sources
 copy_tree_without_vcs "${ASCEND_PLUGIN_ROOT}" "${STAGE_DIR}/LMCache-Ascend"
 
@@ -315,6 +343,8 @@ chmod 600 "${ENV_FILE}"
     fi
 } > "${ENV_FILE}"
 
+if [[ "${ASCEND_CI_DIRECT}" != "1" ]]; then
+
 DOCKER_OPTS=(
     --rm
     --user root
@@ -390,8 +420,22 @@ if on_buildkite; then
     fi
 fi
 
-log "Running Ascend NPU tests in ${IMAGE}"
-docker run "${DOCKER_OPTS[@]}" "${IMAGE}" bash /tmp/run_pytest_inner.sh \
-    || fail "Ascend NPU container failed"
+fi  # ASCEND_CI_DIRECT != 1
+
+if [[ "${ASCEND_CI_DIRECT}" == "1" ]]; then
+    # Run the inner script in place: this container is the NPU container.
+    # Sourcing the env file applies the same values the docker run would
+    # have passed via --env-file.
+    log "Running Ascend NPU tests directly inside the agent container"
+    set -a
+    # shellcheck disable=SC1091
+    . "${ENV_FILE}"
+    set +a
+    bash "${INNER}" || fail "Ascend NPU tests failed (direct mode)"
+else
+    log "Running Ascend NPU tests in ${IMAGE}"
+    docker run "${DOCKER_OPTS[@]}" "${IMAGE}" bash /tmp/run_pytest_inner.sh \
+        || fail "Ascend NPU container failed"
+fi
 
 log "Ascend NPU tests finished"
