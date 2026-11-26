@@ -119,3 +119,8 @@ script can still be used on a development machine.
 | **Tests** | Container | Only through the restricted network, for pip |
 
 See also: [`BK_WEB_SETUP.md`](BK_WEB_SETUP.md), [`run-in-container.sh`](run-in-container.sh).
+
+## Trigger check
+
+Doc-only change to exercise the Ascend910B Buildkite trigger after the trusted
+host runner landed on `dev`. Add the `npu` label. No test code changes.
