@@ -161,3 +161,5 @@ docs/source/locale/**/*.mo
 # CodeBuddy
 .codebuddy
 .venv-test/
+
+# ci trigger check
